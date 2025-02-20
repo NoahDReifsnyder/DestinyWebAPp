@@ -1,2 +1,0 @@
-# DestinyWebApp
-DestinyWebApp
