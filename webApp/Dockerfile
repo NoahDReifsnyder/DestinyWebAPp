@@ -13,7 +13,7 @@ COPY ./requirements.txt /requirements.txt
 RUN pip3 install -r /requirements.txt
 WORKDIR /webApp/
 
-EXPOSE 80
+EXPOSE 8080
 
 CMD ["python3", "auth.py"]
 
