@@ -170,11 +170,10 @@ def start() -> None:
 
     # You should generate cert and private key files and place their path here.
     d = os.path.dirname(os.path.abspath(__file__)) + "/util/"
-    print(d)
     ctx.load_cert_chain(d + "CERT.pem", d + "KEY.pem")
 
     # Run the app.
-    web.run_app(app)
+    web.run_app(app, host="localhost", port=8080, ssl_context=ctx)
 
 
 
