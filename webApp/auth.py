@@ -118,6 +118,7 @@ async def on_start_up(app: web.Application) -> None:
         client_secret="0bTKVixhnt-8AWBhS9w.uNsVhUT94eQuU-OdvuloYmw",
         client_id=41804,
     )
+    await client.start()
     app["client"] = client
     app['users'] = {}
     print("Client has been initialized.")
@@ -173,7 +174,7 @@ def start() -> None:
     ctx.load_cert_chain(d + "CERT.pem", d + "KEY.pem")
 
     # Run the app.
-    web.run_app(app, host="localhost", port=8000, ssl_context=ctx)
+    web.run_app(app)
 
 
 
