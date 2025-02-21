@@ -170,18 +170,12 @@ def start() -> None:
 
     # You should generate cert and private key files and place their path here.
     d = os.path.dirname(os.path.abspath(__file__)) + "/util/"
-<<<<<<< HEAD
-    #print(d)
-    t = "/workspace/nginx/letsencrypt/archive/npm-3/"
-    ctx.load_cert_chain(d + "CERT.pem", d + "KEY.pem")
-    #ctx.load_cert_chain(t + "cert1.pem", t + "privkey1.pem")
-=======
+
     ctx.load_cert_chain(d + "cert.pem", d + "key.pem")
->>>>>>> 7f1ac10b5844afb56b6bf3f5f6e59e25582dd5d2
 
     # Run the app.
     #web.run_app(app, host="172.19.0.2", port=8080, ssl_context=ctx)
-    web.run_app(app, host="localhost", port=8000, ssl_context=ctx)
+    web.run_app(app, host="localhost", port=42697, ssl_context=ctx)
 
 
 
