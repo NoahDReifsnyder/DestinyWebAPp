@@ -63,9 +63,11 @@ async def initialize(client, app):
                 os.remove(exotic_hashes_file_loc)
                 await rest.download_json_manifest()
     else:
+        if not os.path.exists(os.path.dirname(manifest_file_loc)):
+            os.makedirs(os.path.dirname(manifest_file_loc))
         async with client.acquire() as rest:
             print("Manifest not found, downloading...")
-            await rest.download_json_manifest()
+            await rest.download_json_manifest(manifest_file_loc[:-5])
     with open(manifest_file_loc, 'r') as f:
         print("loading manifest from file", manifest_file_loc)
         manifest = app['manifest'] = json.load(f)
