@@ -9,20 +9,14 @@ import aiohttp
 import aiobungie
 import enum
 import sqlite3
-from destiny_helpers import *
+from .destiny_helpers import *
 import importlib
 
 # Web router.
 router = web.RouteTableDef()
-routers = []
 ### import all the routers from the lower level modules, by looping through the modules
 # ### and importing all the routers from them.
 # iterate through all modules in the current directory
-for module in os.listdir(Path(__file__).parent):
-    if os.path.isdir(os.path.join(Path(__file__).parent, module)) and "__init__.py" in os.listdir(os.path.join(Path(__file__).parent, module)):
-        module = importlib.import_module(module)
-        if hasattr(module, "router"):
-            routers.append(module.router)
 users = {}
 
 bucketHashes = None
@@ -156,8 +150,6 @@ def start() -> None:
     app = web.Application()
     # Add the routes.
     app.add_routes(router)
-    for r in routers:
-        app.add_routes(r)
 
     # Add on start and close callbacks
     app.on_startup.append(on_start_up)

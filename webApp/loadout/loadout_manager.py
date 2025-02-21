@@ -2,9 +2,10 @@ import json
 import sqlite3
 from aiohttp import web
 import aiobungie
-from Destiny.help import *
+from webApp.destiny_helpers import *
+from webApp.auth import router
 from multiprocessing.pool import ThreadPool
-router = web.RouteTableDef()
+
 
 
 class Loadout:
