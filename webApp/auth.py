@@ -9,7 +9,7 @@ import aiohttp
 import aiobungie
 import enum
 import sqlite3
-from help import *
+from destiny_helpers import *
 import importlib
 
 # Web router.
@@ -170,7 +170,7 @@ def start() -> None:
 
     # You should generate cert and private key files and place their path here.
     d = os.path.dirname(os.path.abspath(__file__)) + "/util/"
-    ctx.load_cert_chain(d + "CERT.pem", d + "KEY.pem")
+    ctx.load_cert_chain(d + "cert.pem", d + "key.pem")
 
     # Run the app.
     web.run_app(app, host="localhost", port=8080, ssl_context=ctx)
