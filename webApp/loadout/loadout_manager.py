@@ -28,35 +28,15 @@ class Plug:
 
 
 # Initialize SQLite database for loadouts
-def init_db(filename="loadouts.db"):
-    conn = sqlite3.connect(filename)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS loadouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            character_id TEXT NOT NULL,
-            items TEXT NOT NULL,  -- Store items as JSON
-            membership_id TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
-
 
 # Save a loadout to the database
 def save_loadout(conn, name, character_id, items, membership_id):
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO loadouts (name, character_id, items, membership_id) VALUES (?, ?, ?, ?)",
-                   (name, character_id, json.dumps(items), membership_id))
-    conn.commit()
+    return
 
 
 # Load all loadouts for a user from the database
 def load_loadouts(conn, membership_id):
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, character_id, items FROM loadouts WHERE membership_id = ?", (membership_id,))
-    return [{"name": row[0], "character_id": row[1], "items": json.loads(row[2])} for row in cursor.fetchall()]
+    return
 
 
 # Fetch equipped items for a character
@@ -96,24 +76,24 @@ async def apply_loadout(client, loadout, access_token):
 async def loadout_landing(request: web.Request) -> web.Response:
     mem_id = request.query.get("mem_id")
     # get char ids, and provide user with a choice of their characters
-    if "db_conn" not in request.app:
-        request.app["db_conn"] = init_db()
     app = request.app
     client: aiobungie.RESTPool = request.app["client"]
-    conn = request.app["db_conn"]
     access_token = request.app["users"][mem_id]["access_token"]
 
     async with client.acquire() as rest:
         if not (user := app['users'][mem_id].get("user")):
             app['users'][mem_id]["user"] = user = await rest.fetch_current_user_memberships(access_token)
-        profile = await rest.fetch_profile(
-            user["destinyMemberships"][0]["membershipId"],
-            user["destinyMemberships"][0]["membershipType"],
-            [
-                aiobungie.ComponentType.PROFILE,
-            ],
-            access_token)
-        user["c_ids"] = character_ids = profile['profile']['data']['characterIds']
+        if not "c_ids" in user:
+            profile = await rest.fetch_profile(
+                user["destinyMemberships"][0]["membershipId"],
+                user["destinyMemberships"][0]["membershipType"],
+                [
+                    aiobungie.ComponentType.PROFILE,
+                ],
+                access_token)
+            user["c_ids"] = character_ids = profile['profile']['data']['characterIds']
+        else:
+            character_ids = user["c_ids"]
         class_names = {}
         manifest = request.app["manifest"]
         for c_id in character_ids:
@@ -148,9 +128,10 @@ async def loadouts(request: web.Request) -> web.Response:
     c_id = request.query.get("c_id")
     if not mem_id:
         return web.json_response({"error": "membership_id is required"}, status=400)
+    if not c_id:
+        return web.json_response({"error": "character_id is required"}, status=400)
     app = request.app
     client: aiobungie.RESTPool = request.app["client"]
-    conn = request.app["db_conn"]
     access_token = request.app["users"][mem_id]["access_token"]
 
     # Example: Fetch and save a loadout
@@ -167,12 +148,12 @@ async def loadouts(request: web.Request) -> web.Response:
             ],
             access_token)
 
-    print(loadout)
+    #print(loadout)
     l = loadout['characterLoadouts']['data'][c_id]['loadouts'][0]
     current = loadout['characterEquipment']['data'][c_id]['items']
+    item_ids = [x['itemInstanceId'] for x in l['items']]
     #equip all the items but use threads
-    for item in l['items']:
-        pass
+    await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
 
 
 
@@ -187,7 +168,7 @@ async def loadouts(request: web.Request) -> web.Response:
     # if loadouts:
     #     await apply_loadout(client, loadouts[0], access_token)
 
-    return web.json_response({"message": "Loadout operations completed", "loadouts": loadouts})
+    return web.json_response({"message": "Loadout operations completed"})
 
 
 temp = {'loadouts': [{'colorHash': 1693821595, 'iconHash': 797343703, 'nameHash': 2755629639, 'items': [
