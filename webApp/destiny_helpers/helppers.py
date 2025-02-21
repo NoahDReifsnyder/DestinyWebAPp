@@ -5,11 +5,15 @@ import enum
 from pathlib import Path
 from .definitions import *
 
+# get location of this file
 
 
-manifest_file_loc = str(Path(manifest_file_name).absolute())
-exotic_hashes_file_loc = str(Path(exotic_hashes_file_name).absolute())
-bucket_hashes_file_loc = str(Path(bucket_hashes_file_name).absolute())
+# get location of this file
+current_dir = Path(__file__).parent
+
+manifest_file_loc = str((current_dir / manifest_file_name).resolve())
+exotic_hashes_file_loc = str((current_dir / exotic_hashes_file_name).resolve())
+bucket_hashes_file_loc = str((current_dir / bucket_hashes_file_name).resolve())
 
 
 
