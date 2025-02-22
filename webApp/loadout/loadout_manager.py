@@ -6,7 +6,7 @@ from webApp.destiny_helpers import *
 from webApp.auth import router
 from multiprocessing.pool import ThreadPool
 
-
+loadouts = {}
 
 class Loadout:
     def __init__(self, name, character_id, items):
@@ -48,28 +48,22 @@ async def fetch_equipped_items(client, membership_type, membership_id, character
             components=[aiobungie.ComponentType.CHARACTER_EQUIPMENT],
             access_token=access_token
         )
-        character_equipment = profile.characters[character_id].equipment
-        return [item.item_hash for item in character_equipment]
+        return None
 
 
 # Save in-game loadout to the app
 async def save_in_game_loadout(client, conn, membership_type, membership_id, character_id, loadout_name, access_token):
-    items = await fetch_equipped_items(client, membership_type, membership_id, character_id, access_token)
-    save_loadout(conn, loadout_name, character_id, items, membership_id)
-    print(f"Loadout '{loadout_name}' saved.")
+    return None
 
 
 # Equip items from a loadout
 async def equip_items(client, character_id, item_ids, access_token):
-    async with client.acquire() as rest:
-        for item_id in item_ids:
-            await rest.equip_item(character_id, item_id, access_token=access_token)
+    return None
 
 
 # Apply a saved loadout
 async def apply_loadout(client, loadout, access_token):
-    await equip_items(client, loadout["character_id"], loadout["items"], access_token)
-    print(f"Loadout '{loadout['name']}' applied.")
+   return None
 
 
 @router.get("/loadout_landing")
@@ -86,7 +80,7 @@ async def loadout_landing(request: web.Request) -> web.Response:
         if not "c_ids" in user:
             profile = await rest.fetch_profile(
                 user["destinyMemberships"][0]["membershipId"],
-                aiobungie.MembershipType.ALL,
+                aiobungie.MembershipType.STEAM,
                 [
                     aiobungie.ComponentType.PROFILE,
                 ],
@@ -164,9 +158,10 @@ async def loadouts(request: web.Request) -> web.Response:
     if items_to_hash:
         async with client.acquire() as rest:
             for item in items_to_hash:
-                t = await rest.fetch_item(mem_id, item, user["destinyMemberships"][0]["membershipType"], [aiobungie.ComponentType.ITEM_COMMON_DATA])
+                t = await rest.fetch_item(mem_id, item, aiobungie.MembershipType.BUNGIE, [aiobungie.ComponentType.ITEM_COMMON_DATA])
+                #TODO understand why it needs bungie type
                 print(t)
-    await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
+    r = await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
 
 
 

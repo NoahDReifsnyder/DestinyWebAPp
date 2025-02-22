@@ -206,6 +206,7 @@ async def VCA(request: web.Request) -> web.Response:
                 # print progress
                 print(f"{count}/{num_items}")
             for item in exotic_items:
+                print(item)
                 await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,  user["destinyMemberships"][0]["membershipType"])
                 sleep()
                 await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,

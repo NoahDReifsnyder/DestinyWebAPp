@@ -59,7 +59,7 @@ def instance_id_to_hash(instance_id):
     
 
 async def initialize(client, app):
-    global manifest, exotic_item_hashes, bucketHashes, ids
+    global manifest, exotic_item_hashes, bucketHashes, ids_to_hash
     if os.path.exists(manifest_file_loc):
         last_updated = os.path.getmtime(manifest_file_loc)
         if time.time() - last_updated > 86400:
