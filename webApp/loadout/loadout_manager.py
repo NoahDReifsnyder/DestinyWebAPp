@@ -182,12 +182,12 @@ async def loadouts(request: web.Request) -> web.Response:
             items_to_hash.append(x['itemInstanceId'])
         else:
             item_hashes[x['itemInstanceId']] = item_hash
-    if items_to_hash:
-        async with client.acquire() as rest:
-            for item in items_to_hash:
-                t = await rest.fetch_item(mem_id, item, 3, aiobungie.ComponentType.ALL_ITEMS)
-                #TODO understand why it needs bungie type
-                print(t)
+    # if items_to_hash:
+    #     async with client.acquire() as rest:
+    #         for item in items_to_hash:
+    #             t = await rest.fetch_item(mem_id, item, 3, aiobungie.ComponentType.ALL_ITEMS)
+    #             #TODO understand why it needs bungie type
+    #             print(t)
     r = await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
 
 
@@ -203,7 +203,7 @@ async def loadouts(request: web.Request) -> web.Response:
     # if loadouts:
     #     await apply_loadout(client, loadouts[0], access_token)
 
-    return web.json_response({"message": "Loadout operations completed"})
+    return web.json_response(all_loadouts)
 
 
 temp = {'loadouts': [{'colorHash': 1693821595, 'iconHash': 797343703, 'nameHash': 2755629639, 'items': [
