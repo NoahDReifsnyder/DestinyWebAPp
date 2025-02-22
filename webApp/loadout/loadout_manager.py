@@ -203,7 +203,7 @@ async def loadouts(request: web.Request) -> web.Response:
     # if loadouts:
     #     await apply_loadout(client, loadouts[0], access_token)
 
-    return web.json_response(all_loadouts)
+    return web.json_response(loadout['characterLoadouts']['data'][c_id]['loadouts'])
 
 
 temp = {'loadouts': [{'colorHash': 1693821595, 'iconHash': 797343703, 'nameHash': 2755629639, 'items': [
