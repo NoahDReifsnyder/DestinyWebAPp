@@ -86,7 +86,7 @@ async def loadout_landing(request: web.Request) -> web.Response:
         if not "c_ids" in user:
             profile = await rest.fetch_profile(
                 user["destinyMemberships"][0]["membershipId"],
-                user["destinyMemberships"][0]["membershipType"],
+                aiobungie.MembershipType.ALL,
                 [
                     aiobungie.ComponentType.PROFILE,
                 ],
@@ -153,6 +153,19 @@ async def loadouts(request: web.Request) -> web.Response:
     current = loadout['characterEquipment']['data'][c_id]['items']
     item_ids = [x['itemInstanceId'] for x in l['items']]
     #equip all the items but use threads
+    item_hashes = {}
+    items_to_hash = []
+    for x in l["items"]:
+        item_hash = instance_id_to_hash(x['itemInstanceId'])
+        if not item_hash:
+            items_to_hash.append(x['itemInstanceId'])
+        else:
+            item_hashes[x['itemInstanceId']] = item_hash
+    if items_to_hash:
+        async with client.acquire() as rest:
+            for item in items_to_hash:
+                t = await rest.fetch_item(mem_id, item, user["destinyMemberships"][0]["membershipType"], [aiobungie.ComponentType.ITEM_COMMON_DATA])
+                print(t)
     await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
 
 

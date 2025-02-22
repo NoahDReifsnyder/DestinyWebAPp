@@ -67,7 +67,7 @@ async def redirect(request: web.Request) -> web.Response:
             mem_id = str(tokens.membership_id)
             access_token = tokens.access_token
             # store the access_token in a cookie
-            if mem_id not in app['users'] or app['users'][mem_id].get('direct') is None:
+            if mem_id not in app['users']:
                 app['users'][mem_id] = {"access_token": access_token}
                 var = "?mem_id=" + mem_id
                 links = [
@@ -118,23 +118,6 @@ async def on_start_up(app: web.Application) -> None:
     print("Client has been initialized.")
     await initialize(client, app)
 
-
-
-    # if os.path.exists(item_hashes_file_loc):
-    #     with open(item_hashes_file_loc, 'r') as f:
-    #         itemHashValues = [getattr(bucketHashes, e).value for e in json.load(f)]
-    # else:
-    #     itemHashValues = [getattr(bucketHashes, e).value for e in itemHashValues]
-    #     with open(item_hashes_file_loc, 'w') as f:
-    #         json.dump(itemHashValues, f)
-
-
-
-# Replace these with actual membershipType and destinyMembershipId values
-membership_type = 3  # e.g., 3 for Steam
-membership_id = 'YOUR_MEMBERSHIP_ID'
-
-# Fetch profile inventory
 
 async def on_shutdown(app: web.Application) -> None:
     # Called when the app shuts down.

@@ -14,13 +14,15 @@ current_dir = Path(__file__).parent
 manifest_file_loc = str((current_dir / manifest_file_name).resolve())
 exotic_hashes_file_loc = str((current_dir / exotic_hashes_file_name).resolve())
 bucket_hashes_file_loc = str((current_dir / bucket_hashes_file_name).resolve())
+ids_to_hash_file_loc = str((current_dir / ids_to_hash_file_name).resolve())
 
 
 
-itemHashValues = ["kinetic", "energy", "power", "helmet", "gauntlets", "chest", "leg", "class_item"]
+itemHashValues = ["kinetic", "energy", "power", "helmet", "gauntlets", "chest", "leg", "class_item", "general"]
 manifest = None
 exotic_item_hashes = None
 bucketHashes = None
+ids_to_hash = None
 
 
 def getBucketHashes():
@@ -52,8 +54,12 @@ def getItemHashValues():
         itemHashValues = ["kinetic", "energy", "power", "helmet", "gauntlets", "chest", "leg", "class_item"]
     return itemHashValues
 
+def instance_id_to_hash(instance_id):
+    return ids_to_hash.get(instance_id, None)
+    
+
 async def initialize(client, app):
-    global manifest, exotic_item_hashes, bucketHashes
+    global manifest, exotic_item_hashes, bucketHashes, ids
     if os.path.exists(manifest_file_loc):
         last_updated = os.path.getmtime(manifest_file_loc)
         if time.time() - last_updated > 86400:
@@ -93,6 +99,13 @@ async def initialize(client, app):
         bucketHashes = temp
         with open(bucket_hashes_file_loc, 'w') as f:
             json.dump(bucketHashes, f)
+    if os.path.exists(ids_to_hash_file_loc):
+        with open(ids_to_hash_file_loc, 'r') as f:
+            ids_to_hash = json.load(f)
+    else:
+        ids_to_hash = {}
+        with open(ids_to_hash_file_loc, 'w') as f:
+            json.dump(ids_to_hash, f)   
     bucketHashes = enum.Enum('bucketHashes', bucketHashes)
 
 
