@@ -65,6 +65,32 @@ async def equip_items(client, character_id, item_ids, access_token):
 async def apply_loadout(client, loadout, access_token):
    return None
 
+@router.get("/loadouts")
+async def get_current_loadouts(request: web.Request) -> web.Response:
+    mem_id = request.query.get("mem_id")
+    c_id = request.query.get("c_id")
+    access_token = request.app["users"][mem_id]["access_token"]
+    if not mem_id and not c_id:
+        return web.json_response({"error": "membership_id and character_id are required"}, status=400)
+    else:
+        if not mem_id:
+            return web.json_response({"error": "membership_id is required"}, status=400)
+        if not c_id:
+            return web.json_response({"error": "character_id is required"}, status=400)
+    access_token = request.app["users"][mem_id]["access_token"]
+    async with client.acquire() as rest:
+        if not (user := app['users'][mem_id].get("user")):
+                app['users'][mem_id]["user"] = user = await rest.fetch_current_user_memberships(access_token)
+        loadout = await rest.fetch_character(
+            user["destinyMemberships"][0]["membershipId"],
+            user["destinyMemberships"][0]["membershipType"],
+            c_id,
+            [
+                aiobungie.ComponentType.CHARACTER_EQUI
+            ],
+            access_token)
+        return web.json_response(loadout)
+
 
 @router.get("/loadout_landing")
 async def loadout_landing(request: web.Request) -> web.Response:
@@ -111,7 +137,7 @@ async def loadout_landing(request: web.Request) -> web.Response:
             body = ""
             a_template = "<a href='/loadout?c_id={class_id}&" + mem_id_str + "'>{class_name}</a>"
         for c_id, name in [(c_id, user[c_id]['class']) for c_id in character_ids]:
-            body += a_template.format(class_name=name, class_id=c_id)
+            body += a_template.format(class_name=name, class_id=c_id) + "<br>"
         return web.Response(text=html.format(body=body), content_type='text/html')
 
 
@@ -144,6 +170,7 @@ async def loadouts(request: web.Request) -> web.Response:
 
     #print(loadout)
     l = loadout['characterLoadouts']['data'][c_id]['loadouts'][0]
+    all_loadouts = loadout['characterLoadouts']['data']
     current = loadout['characterEquipment']['data'][c_id]['items']
     item_ids = [x['itemInstanceId'] for x in l['items']]
     #equip all the items but use threads
@@ -158,7 +185,7 @@ async def loadouts(request: web.Request) -> web.Response:
     if items_to_hash:
         async with client.acquire() as rest:
             for item in items_to_hash:
-                t = await rest.fetch_item(mem_id, item, aiobungie.MembershipType.BUNGIE, [aiobungie.ComponentType.ITEM_COMMON_DATA])
+                t = await rest.fetch_item(mem_id, item, 3, aiobungie.ComponentType.ALL_ITEMS)
                 #TODO understand why it needs bungie type
                 print(t)
     r = await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
