@@ -2,11 +2,9 @@ import time
 import json
 import os
 import enum
+from sqlitedict import SqliteDict
 from pathlib import Path
 from .definitions import *
-
-# get location of this file
-
 
 # get location of this file
 current_dir = Path(__file__).parent
@@ -15,6 +13,7 @@ manifest_file_loc = str((current_dir / manifest_file_name).resolve())
 exotic_hashes_file_loc = str((current_dir / exotic_hashes_file_name).resolve())
 bucket_hashes_file_loc = str((current_dir / bucket_hashes_file_name).resolve())
 ids_to_hash_file_loc = str((current_dir / ids_to_hash_file_name).resolve())
+data_base_file_loc = str((current_dir / data_base_file_name).resolve())
 
 
 
@@ -23,6 +22,38 @@ manifest = None
 exotic_item_hashes = None
 bucketHashes = None
 ids_to_hash = None
+
+
+
+
+class db:
+    '''
+    this is the database context manager
+    Database Organization:
+
+
+    '''
+    def __init__(self, tablename):
+        if not isinstance(tablename, db.Tables):
+            raise TypeError("tablename must be of type db.Tables")
+        self._tablename = tablename.value
+
+    def __enter__(self):
+        self.conn = SqliteDict(data_base_file_loc,
+                               tablename=self._tablename,
+                               autocommit=True,
+                               outer_stack=verbose_mode,
+                               encode=json.dumps,
+                               decode=json.loads)
+        return self.conn
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.conn.close()
+
+    class Tables(enum.Enum):
+        loadouts = "loadouts"
+        items = "items"
+        users = "users"
 
 
 def getBucketHashes():
@@ -112,7 +143,6 @@ async def initialize(client, app):
 def getBucketHash(itemHash):
     if 'bucketTypeHash' not in getManifest()['DestinyInventoryItemDefinition'][str(itemHash)]['inventory']: return None
     return getManifest()['DestinyInventoryItemDefinition'][str(itemHash)]['inventory']['bucketTypeHash']
-
 
 def sleep():
     time.sleep(.1)

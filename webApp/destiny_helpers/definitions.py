@@ -3,3 +3,5 @@ exotic_hashes_file_name = "data/exotic_item_hashes.json"
 bucket_hashes_file_name = "data/bucket_hashes.json"
 item_hashes_file_name = "data/item_hashes.json"
 ids_to_hash_file_name = "data/ids_to_hash.json"
+data_base_file_name = "data/data_base.json"
+verbose_mode = True

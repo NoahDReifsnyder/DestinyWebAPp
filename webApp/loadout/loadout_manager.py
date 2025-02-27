@@ -27,71 +27,6 @@ class Plug:
         self.plug_hash = plug_hash
 
 
-# Initialize SQLite database for loadouts
-
-# Save a loadout to the database
-def save_loadout(conn, name, character_id, items, membership_id):
-    return
-
-
-# Load all loadouts for a user from the database
-def load_loadouts(conn, membership_id):
-    return
-
-
-# Fetch equipped items for a character
-async def fetch_equipped_items(client, membership_type, membership_id, character_id, access_token):
-    async with client.acquire() as rest:
-        profile = await rest.fetch_profile(
-            membership_type,
-            membership_id,
-            components=[aiobungie.ComponentType.CHARACTER_EQUIPMENT],
-            access_token=access_token
-        )
-        return None
-
-
-# Save in-game loadout to the app
-async def save_in_game_loadout(client, conn, membership_type, membership_id, character_id, loadout_name, access_token):
-    return None
-
-
-# Equip items from a loadout
-async def equip_items(client, character_id, item_ids, access_token):
-    return None
-
-
-# Apply a saved loadout
-async def apply_loadout(client, loadout, access_token):
-   return None
-
-@router.get("/loadouts")
-async def get_current_loadouts(request: web.Request) -> web.Response:
-    mem_id = request.query.get("mem_id")
-    c_id = request.query.get("c_id")
-    access_token = request.app["users"][mem_id]["access_token"]
-    if not mem_id and not c_id:
-        return web.json_response({"error": "membership_id and character_id are required"}, status=400)
-    else:
-        if not mem_id:
-            return web.json_response({"error": "membership_id is required"}, status=400)
-        if not c_id:
-            return web.json_response({"error": "character_id is required"}, status=400)
-    access_token = request.app["users"][mem_id]["access_token"]
-    async with client.acquire() as rest:
-        if not (user := app['users'][mem_id].get("user")):
-                app['users'][mem_id]["user"] = user = await rest.fetch_current_user_memberships(access_token)
-        loadout = await rest.fetch_character(
-            user["destinyMemberships"][0]["membershipId"],
-            user["destinyMemberships"][0]["membershipType"],
-            c_id,
-            [
-                aiobungie.ComponentType.CHARACTER_EQUI
-            ],
-            access_token)
-        return web.json_response(loadout)
-
-
 @router.get("/loadout_landing")
 async def loadout_landing(request: web.Request) -> web.Response:
     mem_id = request.query.get("mem_id")
@@ -141,15 +76,18 @@ async def loadout_landing(request: web.Request) -> web.Response:
         return web.Response(text=html.format(body=body), content_type='text/html')
 
 
+@router.post("/loadout/{mem_id}/{c_id}")
+async def post_loadouts(request: web.Request) -> web.Response:
+
 # Loadout management router
-@router.get("/loadout")
-async def loadouts(request: web.Request) -> web.Response:
-    mem_id = request.query.get("mem_id")
-    c_id = request.query.get("c_id")
+@router.get("/loadout/{mem_id}/{c_id}")
+async def get_loadouts(request: web.Request) -> web.Response:
+    mem_id = request.match_info["mem_id"]
+    c_id = request.match_info["c_id"]
     if not mem_id:
-        return web.json_response({"error": "membership_id is required"}, status=400)
+       return web.json_response({"error": "membership_id is required"}, status=400)
     if not c_id:
-        return web.json_response({"error": "character_id is required"}, status=400)
+       return web.json_response({"error": "character_id is required"}, status=400)
     app = request.app
     client: aiobungie.RESTPool = request.app["client"]
     access_token = request.app["users"][mem_id]["access_token"]
@@ -164,32 +102,26 @@ async def loadouts(request: web.Request) -> web.Response:
             user["destinyMemberships"][0]["membershipType"],
             [
                 aiobungie.ComponentType.CHARACTER_LOADOUTS,
-                aiobungie.ComponentType.CHARACTER_EQUIPMENT
+                aiobungie.ComponentType.CHARACTER_EQUIPMENT,
+                aiobungie.ComponentType.CHARACTER_INVENTORY,
+                aiobungie.ComponentType.PROFILE_INVENTORIES,
             ],
             access_token)
+    with db(db.Tables.loadouts) as conn:
+        conn[c_id]=loadout['characterLoadouts']['data'][c_id]['loadouts']
 
     #print(loadout)
     l = loadout['characterLoadouts']['data'][c_id]['loadouts'][0]
+    items = loadout['characterEquipment']['data'][c_id]['items']
     all_loadouts = loadout['characterLoadouts']['data']
     current = loadout['characterEquipment']['data'][c_id]['items']
     item_ids = [x['itemInstanceId'] for x in l['items']]
-    #equip all the items but use threads
-    item_hashes = {}
-    items_to_hash = []
-    for x in l["items"]:
-        item_hash = instance_id_to_hash(x['itemInstanceId'])
-        if not item_hash:
-            items_to_hash.append(x['itemInstanceId'])
-        else:
-            item_hashes[x['itemInstanceId']] = item_hash
-    # if items_to_hash:
-    #     async with client.acquire() as rest:
-    #         for item in items_to_hash:
-    #             t = await rest.fetch_item(mem_id, item, 3, aiobungie.ComponentType.ALL_ITEMS)
-    #             #TODO understand why it needs bungie type
-    #             print(t)
-    r = await rest.equip_items(access_token, item_ids, c_id, user["destinyMemberships"][0]["membershipType"])
-
+    all_items = loadout['profileInventory']['data']['items'] + [x for c_id in loadout['characterEquipment']['data'] for x in loadout['characterEquipment']['data'][c_id]['items']] + [x for c_id in loadout['characterInventories']['data'] for x in loadout['characterInventories']['data'][c_id]['items']]
+    all_instance_ids = [x['itemInstanceId'] for x in all_items if 'itemInstanceId' in x]
+    #find exotics
+    exotic_instance_ids = [x['itemInstanceId'] for x in all_items if 'itemInstanceId' in x and x['itemInstanceId'] in item_ids and is_item_exotic(x['itemHash'])]
+    r = await rest.equip_items(access_token, [x for x in item_ids if x not in exotic_instance_ids], c_id, user["destinyMemberships"][0]["membershipType"])
+    r = await rest.equip_items(access_token, exotic_instance_ids, c_id, user["destinyMemberships"][0]["membershipType"])
 
 
     # Save current loadout
