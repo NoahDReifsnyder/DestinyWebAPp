@@ -66,12 +66,50 @@ class Database(dict):
             self._parent._persist_child(self._parent_key)
 
 class Database2(dict):
-    def __init__(self, filename, autocommit=True, encode=json.dumps, decode=json.loads,
-                 _parent=None, _parent_key=None):
+    def __init__(self, filename, autocommit=True, encode=json.dumps, decode=json.loads, parent_keys=[]):
         super().__init__()
-        self._db = SqliteDict(filename, autocommit=autocommit, encode=encode,
-                              decode=decode) if _parent is None else _parent._db
+        if filename and '.' in filename:
+            filename = filename.split('.')[0]
+        if not parent_keys:
+            parent_keys = [filename]
+        filename = '_'.join(parent_keys) + '.db'
+        print("DB FILENAME", filename)
+        self._filename = filename
+        self._db = SqliteDict(filename, autocommit=autocommit, encode=encode, decode=decode)
+        self._parent_keys = parent_keys
+
+    # --- Override __getitem__ ---
+    def __getitem__(self, key):
+        return super().__getitem__(key)
+
+    # --- Override __setitem__ ---
+    def __setitem__(self, key, value):
+        print("SETTING", key, type(key), value, type(value))
+        if isinstance(value, dict):
+            new_value = Database2(None, parent_keys=self._parent_keys + [key])
+            print("new_file", new_value._filename)
+            for k, v in value.items():
+                new_value[k] = new_value
+        else:
+            new_value = value
+        super().__setitem__(key, new_value)
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+
+
 
 
 if __name__ == "__main__":
-
+    db = Database2('test.db')
+    db['test'] = {'a': {'b': 1, 'c': 2}}
+    print(db, type(db))
+    print(db['test'], type(db['test']))
+    print(db['test']['a'], type(db['test']['a']))
+    print(db._db)
+    db['test']['a'] = 3
+    # db['test']['c'] = 3
+    # print(db['test'])
+    # db['test']['a'] = 4
+    # db['test'] = db['test']
+    # print(db['test'])
