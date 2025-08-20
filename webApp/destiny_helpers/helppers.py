@@ -2,12 +2,14 @@ import time
 import json
 import os
 import enum
-from sqlitedict import SqliteDict
 from pathlib import Path
 from .definitions import *
+import aiobungie
+from aiohttp import web
 
 # get location of this file
 current_dir = Path(__file__).parent
+debug = False
 
 manifest_file_loc = str((current_dir / manifest_file_name).resolve())
 exotic_hashes_file_loc = str((current_dir / exotic_hashes_file_name).resolve())
@@ -26,34 +28,7 @@ ids_to_hash = None
 
 
 
-class db:
-    '''
-    this is the database context manager
-    Database Organization:
 
-
-    '''
-    def __init__(self, tablename):
-        if not isinstance(tablename, db.Tables):
-            raise TypeError("tablename must be of type db.Tables")
-        self._tablename = tablename.value
-
-    def __enter__(self):
-        self.conn = SqliteDict(data_base_file_loc,
-                               tablename=self._tablename,
-                               autocommit=True,
-                               outer_stack=verbose_mode,
-                               encode=json.dumps,
-                               decode=json.loads)
-        return self.conn
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.conn.close()
-
-    class Tables(enum.Enum):
-        loadouts = "loadouts"
-        items = "items"
-        users = "users"
 
 
 def getBucketHashes():
@@ -62,6 +37,14 @@ def getBucketHashes():
         with open(bucket_hashes_file_loc, 'r') as f:
             bucketHashes = enum.Enum('bucketHashes', json.load(f))
     return bucketHashes
+
+def getInventoryHashDict():
+    with open(bucket_hashes_file_loc, 'r') as f:
+        inventoryHashDict = json.load(f)
+    return {k: inventoryHashDict[k] for k in getItemHashValues()}
+
+
+
 
 
 def getManifest():
@@ -87,18 +70,29 @@ def getItemHashValues():
 
 def instance_id_to_hash(instance_id):
     return ids_to_hash.get(instance_id, None)
-    
+
+
+async def refresh_tokens(app: web.Application, mem_id: str) -> None:
+    client: aiobungie.RESTPool = app["client"]
+    refresh_token = app["users"][mem_id]["refresh_token"]
+    async with client.acquire() as rest:
+        tokens = await rest.refresh_access_token(refresh_token)
+        app["users"][mem_id]["access_token"] = tokens.access_token
+        app["users"][mem_id]["refresh_token"] = tokens.refresh_token
+        print(f"Refreshed token for {mem_id}")
+
+
 
 async def initialize(client, app):
     global manifest, exotic_item_hashes, bucketHashes, ids_to_hash
     if os.path.exists(manifest_file_loc):
         last_updated = os.path.getmtime(manifest_file_loc)
-        if time.time() - last_updated > 86400:
+        if time.time() - last_updated > 86400: #TODO
             async with client.acquire() as rest:
                 print("Manifest out of date, updating...")
                 os.remove(manifest_file_loc)
                 os.remove(exotic_hashes_file_loc)
-                await rest.download_json_manifest()
+                await rest.download_json_manifest(manifest_file_loc[:-5])
     else:
         if not os.path.exists(os.path.dirname(manifest_file_loc)):
             os.makedirs(os.path.dirname(manifest_file_loc))
@@ -140,6 +134,10 @@ async def initialize(client, app):
     bucketHashes = enum.Enum('bucketHashes', bucketHashes)
 
 
+def snapShotInventory(character)
+    return [x for x in character['inventory']['data']['items'] if x['bucketHash'] == getBucketHashes().kinetic.value]
+
+
 def getBucketHash(itemHash):
     if 'bucketTypeHash' not in getManifest()['DestinyInventoryItemDefinition'][str(itemHash)]['inventory']: return None
     return getManifest()['DestinyInventoryItemDefinition'][str(itemHash)]['inventory']['bucketTypeHash']
@@ -153,6 +151,13 @@ def is_item_locked(item_state):
     LOCKED_STATE_MASK = 0b00000001  # The first bit represents locked state
     return (item_state & LOCKED_STATE_MASK) != 0
 
+def is_item_crafted(item_state):
+    # Crafted state is represented by the 4th bit (value of 8) in the item state bitmask
+    CRAFTED_STATE_MASK = 0b00001000  # The fourth bit represents crafted state
+    return (item_state & CRAFTED_STATE_MASK) != 0
+
+def is_special(item):
+    return is_item_crafted(item['state']) or is_item_exotic(item['itemHash'])
 
 def is_item_exotic(item_hash):
     return item_hash in getExoticItemHashes()

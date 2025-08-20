@@ -132,15 +132,18 @@ async def VCA(request: web.Request) -> web.Response:
                 [
                     aiobungie.ComponentType.PROFILE_INVENTORIES,
                     aiobungie.ComponentType.PROFILE,
+                    aiobungie.ComponentType.ITEM_INSTANCES,
+                    aiobungie.ComponentType.ITEM_STATS,
                 ],
                 access_token
             )
+            gear_tiers = {x: (character_ids['itemComponents']['instances']['data'][x]['gearTier'], None) for x in character_ids['itemComponents']['instances']['data']}
             inv = character_ids['profileInventory']['data']['items']
             # for item in inv:
             #     inv_info = await rest.fetch_inventory_item(item['itemHash'])
             #     print(inv_info)
             character_ids = character_ids['profile']['data']['characterIds']
-            best_score = 100
+            best_score = -1
             best_cid = None
             need_empty = []
             c_invs = {}
@@ -152,9 +155,12 @@ async def VCA(request: web.Request) -> web.Response:
                     c_id,
                     [
                         aiobungie.ComponentType.CHARACTER_INVENTORY,
+                        aiobungie.ComponentType.ITEM_INSTANCES,
+                        aiobungie.ComponentType.ITEM_STATS,
                     ],
                     access_token
                 )
+                gear_tiers.update({x: (character['itemComponents']['instances']['data'][x]['gearTier'], c_id) for x in character['itemComponents']['instances']['data']})
                 c_invs[c_id] = char_inv = [x for x in character['inventory']['data']['items']]
                 primaries = [x for x in char_inv if x['bucketHash'] == getBucketHashes().kinetic.value]
                 energies = [x for x in char_inv if x['bucketHash'] == getBucketHashes().energy.value]
@@ -167,68 +173,107 @@ async def VCA(request: web.Request) -> web.Response:
                 buckets = [primaries, energies, heavies, helms, gauntlets, chests, legs, class_items]
                 buckets = [helms, gauntlets, chests, legs, class_items]
                 c_inv = c_inv + [(x,c_id) for y in buckets for x in y if not is_item_locked(x['state'])]
-                score = len([x for x in buckets if len(x) == 9])
-                if score < best_score:
+                score = sum(1 for x in buckets for item in x if not is_item_locked(item['state']))
+                if score > best_score:
                     best_score = score
                     best_cid = c_id
-                    need_empty = [x[0]['bucketHash'] for x in buckets if len(x) == 9]
                 # int(f'{x['state']:08b}'[-1]) == 0 means unlocked (bit 1 of state is off)
-            for h in need_empty:
-                unlocked = [x for x in c_invs[best_cid] if not is_item_locked(x['state']) and x['bucketHash'] == h]
-                if not unlocked:
-                    unlocked = [x for x in c_invs[best_cid] if x['bucketHash'] == h]
-                item = unlocked[0]
+            for item in c_invs[best_cid]:
+                if not is_item_locked(item['state']):
+                    continue
+
                 await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,
                                          user["destinyMemberships"][0]["membershipType"], vault=True)
                 c_invs[best_cid].remove(item)
             temp = getBucketHashes()
-            items = [x for x in inv if
-                     not is_item_locked(x['state']) and x['bucketHash'] in [temp[x].value for x in itemHashValues]]
-            #sort by if exotic
+
+            # Filter relevant items from inventory
             bucket_hash_values = [temp[e].value for e in itemHashValues]
-            items = [x for x in inv if
-                     not is_item_locked(x['state']) and x['bucketHash'] in bucket_hash_values]
-            num_items = len(items + c_inv)
-            exotic_items = [x for x in items if is_item_exotic(x['itemHash'])]
-            items = [x for x in items if not is_item_exotic(x['itemHash'])]
-            exotic_c_inv = [x for x in c_inv if is_item_exotic(x[0]['itemHash'])]
-            c_inv = [x for x in c_inv if not is_item_exotic(x[0]['itemHash'])]
+            items = [
+                x for x in inv
+                if not is_item_locked(x['state']) and x['bucketHash'] in bucket_hash_values
+            ]
 
-
-
-
-
+            # Crafted or Exotic = "special"
+            trash_items = [(x, gear_tiers[x['itemInstanceId']][1]) for x in inv if x['bucketHash'] in bucket_hash_values and gear_tiers[x['itemInstanceId']][0] <= 3 and not is_special(x)]
+            len_items = len(trash_items)
             count = 0
-            for item, c_id in exotic_c_inv:
-                await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], c_id,
-                                         user["destinyMemberships"][0]["membershipType"], vault=True)
+            for item, c_id in trash_items:
+                if not c_id:
+                    c_id = best_cid
+                #unlock the item
+
+                #transfer it to the best character
+                print(f"Transferring {item['itemInstanceId']} to {c_id}: count: {count}/{len_items}")
                 count += 1
-                # print progress
+
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], best_cid,
+                    user["destinyMemberships"][0]["membershipType"]
+                )
+                await rest.set_item_lock_state(access_token, False, item_id=item['itemInstanceId'], character_id=best_cid, membership_type=user["destinyMemberships"][0]["membershipType"])
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], best_cid,
+                    user["destinyMemberships"][0]["membershipType"], vault=True
+                )
+
+
+            special_items = [x for x in items if is_special(x)]
+            normal_items = [x for x in items if not is_special(x)]
+
+            special_c_inv = [x for x in c_inv if is_special(x[0])]
+            normal_c_inv = [x for x in c_inv if not is_special(x[0])]
+
+            # Calculate total for progress tracking
+            num_items = len(special_items + normal_items + special_c_inv + normal_c_inv)
+
+            # Transfer normal_c_inv first
+            count = 0
+            for item, c_id in normal_c_inv:
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], c_id,
+                    user["destinyMemberships"][0]["membershipType"], vault=True
+                )
+                count += 1
                 print(f"{count}/{num_items}")
-            for item in exotic_items:
-                print(item)
-                await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,  user["destinyMemberships"][0]["membershipType"])
+
+            # Then normal items
+            for item in normal_items:
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], best_cid,
+                    user["destinyMemberships"][0]["membershipType"]
+                )
                 sleep()
-                await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,
-                                         user["destinyMemberships"][0]["membershipType"], vault=True)
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], best_cid,
+                    user["destinyMemberships"][0]["membershipType"], vault=True
+                )
                 count += 1
-                # print progress
                 print(f"{count}/{num_items}")
-            for item, c_id in c_inv:
-                await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], c_id,
-                                         user["destinyMemberships"][0]["membershipType"], vault=True)
+
+            # Then special_c_inv
+            for item, c_id in special_c_inv:
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], c_id,
+                    user["destinyMemberships"][0]["membershipType"], vault=True
+                )
                 count += 1
-                # print progress
                 print(f"{count}/{num_items}")
-            for item in items:
-                await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,
-                                         user["destinyMemberships"][0]["membershipType"])
+
+            # Finally special items
+            for item in special_items:
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], best_cid,
+                    user["destinyMemberships"][0]["membershipType"]
+                )
                 sleep()
-                await rest.transfer_item(access_token, item['itemInstanceId'], item['itemHash'], best_cid,
-                                         user["destinyMemberships"][0]["membershipType"], vault=True)
+                await rest.transfer_item(
+                    access_token, item['itemInstanceId'], item['itemHash'], best_cid,
+                    user["destinyMemberships"][0]["membershipType"], vault=True
+                )
                 count += 1
-                # print progress
                 print(f"{count}/{num_items}")
+
         # Return a JSON response.
         return web.json_response(user)
     else:

@@ -66,14 +66,17 @@ async def redirect(request: web.Request) -> web.Response:
             # Store the access token in the pool metadata.
             mem_id = str(tokens.membership_id)
             access_token = tokens.access_token
+            refresh_token = tokens.refresh_token
             # store the access_token in a cookie
             if mem_id not in app['users']:
-                app['users'][mem_id] = {"access_token": access_token}
+                app['users'][mem_id] = {"access_token": access_token, "refresh_token": refresh_token}
                 var = "?mem_id=" + mem_id
                 links = [
                     ("Pull Postmaster", f"/pullPM{var}"),
                     ("Vault Clearing Assistant", f"/VCA{var}"),
-                    ("Loadout Manager", f"/loadout_landing{var}")
+                    ("Loadout Manager", f"/loadout_landing{var}"),
+                    ("Light Level Companion", f"/LLC{var}")
+
                 ]
 
                 # Create HTML links dynamically
@@ -115,6 +118,7 @@ async def on_start_up(app: web.Application) -> None:
     await client.start()
     app["client"] = client
     app['users'] = {}
+    app["cleaners"] = {}
     print("Client has been initialized.")
     await initialize(client, app)
 

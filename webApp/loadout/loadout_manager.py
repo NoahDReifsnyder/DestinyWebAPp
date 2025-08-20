@@ -6,26 +6,6 @@ from webApp.destiny_helpers import *
 from webApp.auth import router
 from multiprocessing.pool import ThreadPool
 
-loadouts = {}
-
-class Loadout:
-    def __init__(self, name, character_id, items):
-        self.name = name
-        self.character_id = character_id
-        self.items = items
-
-
-class Item:
-    def __init__(self, item_hash, item_instance_id, state, plugs=[]):
-        self.item_hash = item_hash
-        self.item_instance_id = item_instance_id
-        self.state = state
-        self.plugs = plugs
-
-class Plug:
-    def __init__(self, plug_hash, plug_instance_id, state):
-        self.plug_hash = plug_hash
-
 
 @router.get("/loadout_landing")
 async def loadout_landing(request: web.Request) -> web.Response:
