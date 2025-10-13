@@ -134,7 +134,7 @@ async def initialize(client, app):
     bucketHashes = enum.Enum('bucketHashes', bucketHashes)
 
 
-def snapShotInventory(character)
+def snapShotInventory(character):
     return [x for x in character['inventory']['data']['items'] if x['bucketHash'] == getBucketHashes().kinetic.value]
 
 
@@ -161,3 +161,9 @@ def is_special(item):
 
 def is_item_exotic(item_hash):
     return item_hash in getExoticItemHashes()
+
+def name_from_hash(item_hash):
+    return manifest["DestinyInventoryItemDefinition"][str(item_hash)]['displayProperties']['name']
+
+def class_from_id(c_id):
+    pass
