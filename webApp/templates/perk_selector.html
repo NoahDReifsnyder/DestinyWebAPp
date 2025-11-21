@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ weapon_name or "Select Your Perk Combinations" }}</title>
+    <style>
+        body {
+          font-family: system-ui, sans-serif;
+          background: #0f0f0f;
+          color: #eee;
+          margin: 0;
+          padding: 1rem;
+        }
+
+        h1 {
+          text-align: center;
+          margin: 1rem 0;
+          font-size: 1.5rem;
+        }
+
+        form {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 1rem;
+          justify-content: center;
+        }
+
+        .perk-column {
+          background: #1a1a1a;
+          border-radius: 8px;
+          padding: 0.75rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+          width: auto;
+          min-width: 200px;
+        }
+
+        .perk-column h2 {
+          font-size: 1rem;
+          border-bottom: 1px solid #333;
+          padding-bottom: 0.25rem;
+          margin-bottom: 0.5rem;
+          text-align: center;
+          white-space: nowrap;
+        }
+
+        .perk {
+          margin: 0.2rem 0;
+        }
+
+        .perk label {
+          cursor: pointer;
+          display: block;
+          white-space: nowrap;
+          line-height: 1.2;
+          font-size: 0.95rem;
+        }
+
+        button {
+          display: block;
+          margin: 1rem auto;
+          padding: 0.5rem 1.5rem;
+          background: #0078ff;
+          color: white;
+          border: none;
+          border-radius: 6px;
+          cursor: pointer;
+          font-size: 0.95rem;
+        }
+
+        button:hover {
+          background: #005fd1;
+        }
+
+        .selections {
+          margin-top: 2rem;
+          background: #181818;
+          border-radius: 8px;
+          padding: 1rem;
+          max-width: 600px;
+          margin-left: auto;
+          margin-right: auto;
+        }
+
+        .selections h2 {
+          text-align: center;
+          border-bottom: 1px solid #333;
+          padding-bottom: 0.5rem;
+          margin-bottom: 0.75rem;
+        }
+
+        .selection-instance {
+          margin-bottom: 1rem;
+          padding: 0.5rem;
+          background: #222;
+          border-radius: 6px;
+        }
+
+        .selection {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: #2a2a2a;
+          padding: 0.4rem 0.6rem;
+          margin: 0.2rem 0;
+          border-radius: 4px;
+        }
+
+        .selection button {
+          background: #ff4747;
+          padding: 0.3rem 0.7rem;
+          font-size: 0.8rem;
+          border-radius: 4px;
+        }
+
+        .selection button:hover {
+          background: #d93030;
+        }
+
+        @media (max-width: 1000px) {
+          .perk-column {
+            width: 100%;
+          }
+        }
+    </style>
+</head>
+<body>
+<h1>{{ weapon_name or "Select Your Perk Combinations" }}</h1>
+
+<!-- PERK SELECTOR FORM -->
+<form method="post" action="/submit_perks">
+    <input type="hidden" name="item_hash" value="{{ item_hash }}">
+
+    {% set active_instance = selected_perks[0] if selected_perks else {} %}
+
+    {% for socket_name, perks in sockets.items() %}
+    <div class="perk-column">
+        <h2>{{ socket_name }}</h2>
+        {% for perk_name, perk_hash in perks %}
+        <div class="perk">
+            <label>
+                <input type="checkbox"
+                       name="{{ socket_name }}"
+                       value='{"perk_hash": "{{ perk_hash }}", "perk_name": "{{ perk_name }}"}'
+                       {% if socket_name in active_instance and perk_name== active_instance[socket_name]["perk_name"] %}
+                checked
+                {% endif %}>
+                {{ perk_name }}
+            </label>
+        </div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+
+    <button type="submit">Save Selection</button>
+</form>
+
+<!-- CURRENT SAVED SELECTIONS -->
+{% if selected_perks %}
+<div class="selections">
+  <h2>Current Saved Selections</h2>
+  {% for instance in selected_perks %}
+    {% set instance_index = loop.index0 %}
+    <div class="selection-instance">
+      <h3>Instance {{ loop.index }}</h3>
+      <div class="selection">
+        <span>
+          {% for socket_name, perk in instance.items() if socket_name != "item_hash" %}
+            <strong>{{ socket_name }}</strong>: {{ perk["perk_name"] }}{% if not loop.last %}, {% endif %}
+          {% endfor %}
+        </span>
+        <form method="post" action="/delete_perk" style="margin: 0;">
+          <input type="hidden" name="item_hash" value="{{ item_hash }}">
+          <input type="hidden" name="instance_index" value="{{ instance_index }}">
+          <button type="submit">Delete</button>
+        </form>
+      </div>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if load_next %}
+<!-- DONE BUTTON -->
+<form method="post" action="/next_weapon">
+    <input type="hidden" name="item_hash" value="{{ item_hash }}">
+    <button type="submit" style="
+        display:block;
+        margin: 1rem auto;
+        padding: 0.6rem 2rem;
+        background: #28a745;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-size: 1rem;
+        cursor: pointer;
+    ">
+        ✅ Done with this Weapon
+    </button>
+</form>
+{% endif %}
+
+{% if not load_next %}
+<!-- DONE BUTTON -->
+<form method="post" action="/finish_selections">
+    <input type="hidden" name="item_hash" value="{{ item_hash }}">
+    <button type="submit" style="
+        display:block;
+        margin: 1rem auto;
+        padding: 0.6rem 2rem;
+        background: #28a745;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-size: 1rem;
+        cursor: pointer;
+    ">
+        ✅ Complete Perk Review!
+    </button>
+</form>
+{% endif %}
+
+
+<!-- SINGLE SELECTION SCRIPT -->
+<script>
+    document.querySelectorAll('.perk-column').forEach(column => {
+      const checkboxes = column.querySelectorAll('input[type="checkbox"]');
+      checkboxes.forEach(box => {
+        box.addEventListener('change', () => {
+          if (box.checked) {
+            checkboxes.forEach(other => {
+              if (other !== box) other.checked = false;
+            });
+          }
+        });
+      });
+    });
+</script>
+</body>
+</html>

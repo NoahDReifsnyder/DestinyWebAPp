@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Weapon Inventory</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white p-6">
+
+    <h1 class="text-3xl mb-4">Weapon Inventory</h1>
+
+    <!-- Global batch action buttons -->
+    <div class="mb-6 space-x-4">
+        <button class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded" onclick="batchAction('discard')">Discard All</button>
+        <button class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded" onclick="batchAction('keep')">Keep All</button>
+        <button class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded" onclick="batchAction('perk')">Mark for Perk Selection</button>
+    </div>
+
+    <!-- Weapon sections by type -->
+    <div id="weapon-sections" class="space-y-6">
+        {% for weapon_type, weapon_list in weapons.items() %}
+        {% set type_id = weapon_type|replace(' ', '_') %}
+        <div class="bg-gray-800 rounded-lg overflow-hidden">
+
+            <!-- Section header -->
+            <button
+                class="w-full text-left px-4 py-3 flex justify-between items-center bg-gray-700 hover:bg-gray-600 rounded-t-lg"
+                onclick="toggleSection('{{ type_id }}')"
+            >
+                <span class="text-xl font-semibold">{{ weapon_type|title }}</span>
+                <span id="{{ type_id }}-arrow" class="transition-transform duration-300">▼</span>
+            </button>
+
+            <!-- Per-section batch buttons -->
+            <div class="px-4 py-2 flex gap-2 text-sm">
+                <button class="bg-red-600 hover:bg-red-700 px-2 py-1 rounded"
+                        onclick="batchAction('discard', '{{ type_id }}')">Discard All</button>
+                <button class="bg-green-600 hover:bg-green-700 px-2 py-1 rounded"
+                        onclick="batchAction('keep', '{{ type_id }}')">Keep All</button>
+                <button class="bg-yellow-600 hover:bg-yellow-700 px-2 py-1 rounded"
+                        onclick="batchAction('perk', '{{ type_id }}')">Mark for Perk Selection</button>
+            </div>
+
+            <!-- Collapsible weapon grid -->
+            <div id="{{ type_id }}-content" class="grid grid-cols-4 gap-4 p-4 hidden">
+                {% for weapon in weapon_list %}
+                <div class="bg-gray-900 rounded p-2 flex flex-col items-center weapon-card"
+                     data-hash="{{ weapon.hash }}"
+                     data-type="{{ weapon_type }}">
+                    <img src="{{ weapon.icon }}" alt="{{ weapon.name }}" class="w-20 h-20 mb-2">
+                    <span class="text-center text-sm">{{ weapon.name }}</span>
+                    <select class="mt-2 bg-gray-700 text-white rounded px-2 py-1 w-full">
+                        <option value="keep">Keep</option>
+                        <option value="discard">Discard</option>
+                        <option value="perk">Mark for Perk Selection</option>
+                    </select>
+                </div>
+                {% endfor %}
+            </div>
+
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Submit button -->
+    <div class="mt-6">
+        <button class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded" onclick="submitSelectionsForm()">Submit Selections</button>
+    </div>
+
+<script>
+    // Toggle collapsible sections
+    function toggleSection(typeId) {
+        const content = document.getElementById(`${typeId}-content`);
+        const arrow = document.getElementById(`${typeId}-arrow`);
+        if (!content || !arrow) return;
+        content.classList.toggle("hidden");
+        arrow.classList.toggle("rotate-180");
+    }
+
+    // Batch action
+    function batchAction(action, typeId=null) {
+        const selector = typeId
+            ? `.weapon-card[data-type="${typeId.replace('_', ' ')}"] select`
+            : '.weapon-card select';
+        document.querySelectorAll(selector).forEach(sel => sel.value = action);
+    }
+
+    // Submit selections using a normal form (no fetch)
+    function submitSelectionsForm() {
+        const selections = {};
+        document.querySelectorAll('.weapon-card').forEach(card => {
+            const hash = card.dataset.hash;
+            const action = card.querySelector('select').value;
+            selections[hash] = action;
+        });
+
+        const form = document.createElement('form');
+        form.method = 'POST'; // Use POST (or simulate PUT server-side)
+        form.action = '/api/weapons/selections';
+
+        // Add selections as hidden inputs
+        for (const [hash, action] of Object.entries(selections)) {
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = hash;
+            input.value = action;
+            form.appendChild(input);
+        }
+
+        document.body.appendChild(form);
+        form.submit(); // browser handles redirect automatically
+    }
+</script>
+
+</body>
+</html>

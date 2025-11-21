@@ -3,7 +3,8 @@ import sqlite3
 from aiohttp import web
 import aiobungie
 from webApp.destiny_helpers import *
-from webApp.auth import router
+#from webApp.auth import router
+router = web.RouteTableDef()
 from multiprocessing.pool import ThreadPool
 
 

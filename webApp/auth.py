@@ -1,16 +1,12 @@
 
 """An example on how to use Bungie OAuth2 purely using aiobungie and aiohttp.web only."""
-import json
+import pdb
 import ssl
-import os
+import aiohttp_jinja2
+import jinja2
 
-from aiohttp import web
-import aiohttp
-import aiobungie
-import enum
-import sqlite3
 from .destiny_helpers import *
-import importlib
+
 
 # Web router.
 router = web.RouteTableDef()
@@ -71,12 +67,14 @@ async def redirect(request: web.Request) -> web.Response:
             if mem_id not in app['users']:
                 app['users'][mem_id] = {"access_token": access_token, "refresh_token": refresh_token}
                 var = "?mem_id=" + mem_id
+                #links = [(x.url_for().raw_path, f"/{x.url_for().raw_path.replace(' ', '').lower()}{var}") for x in app.router.routes()]
+
                 links = [
                     ("Pull Postmaster", f"/pullPM{var}"),
                     ("Vault Clearing Assistant", f"/VCA{var}"),
-                    ("Loadout Manager", f"/loadout_landing{var}"),
-                    ("Light Level Companion", f"/LLC{var}")
-
+                    #("Loadout Manager", f"/loadout_landing{var}"),
+                    ("Light Level Companion", f"/LLC{var}"),
+                    ("Perk Manager", "/perk_manager"),
                 ]
 
                 # Create HTML links dynamically
@@ -84,10 +82,12 @@ async def redirect(request: web.Request) -> web.Response:
 
                 # Wrap in HTML body
                 response_text = f"<html><body>{html_links}</body></html>"
-                return web.Response(
+                response = web.Response(
                     text=response_text,
                     content_type='text/html',
                     charset='utf-8')
+                response.set_cookie('mem_id', mem_id)
+                return response
             else:
                 app['users'][mem_id]["access_token"] = access_token
                 return await app['users'][mem_id]["direct"](mem_id)
@@ -135,6 +135,12 @@ async def direct(request: web.Request) -> web.Response:
 def start() -> None:
     # The application itself.
     app = web.Application()
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.join(BASE_DIR, 'templates')
+    print(template_path)
+
+    aiohttp_jinja2.setup(app, loader=jinja2.FileSystemLoader(template_path))
+
     # Add the routes.
     app.add_routes(router)
 

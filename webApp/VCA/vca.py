@@ -8,7 +8,6 @@ from webApp.auth import router
 import pdb
 import asyncio
 
-
 async def pullPMhelper(client, mem_id, users, manifest):
     async with (client.acquire() as rest):
         access_token = users[mem_id].get("access_token")
@@ -263,7 +262,7 @@ async def VCA(request: web.Request) -> web.Response:
                 # Move just enough to hit the target_free
                 for it in candidates[:need]:
                     await _transfer_to_vault_with_wait(
-                        rest, access_token, it, best_cid, membership_type
+                        rest, access_token, it['itemInstanceId'], it['itemHash'], best_cid, membership_type
                     )
                     # keep your local snapshot consistent
                     c_invs[best_cid].remove(it)
@@ -285,6 +284,7 @@ async def VCA(request: web.Request) -> web.Response:
                 )
 
             temp = getBucketHashes()
+            temp_armor = getArmorHashes()
 
             # Filter relevant items from inventory
             bucket_hash_values = [temp[e].value for e in itemHashValues]
@@ -298,6 +298,9 @@ async def VCA(request: web.Request) -> web.Response:
                            if x['bucketHash'] in bucket_hash_values
                            and gear_tiers[x['itemInstanceId']][0] <= 3
                            and not is_special(x)]
+            #include armor pieces of tier 4
+            trash_items += [(x, gear_tiers[x['itemInstanceId']][1]) for x in inv if
+                            x['bucketHash'] in temp_armor and gear_tiers[x['itemInstanceId']][0] == 4 and not is_special(x)]
 
             non_trash_items = [(x, gear_tiers[x['itemInstanceId']][1]) for x in inv if
                                x['bucketHash'] in bucket_hash_values and gear_tiers[x['itemInstanceId']][
