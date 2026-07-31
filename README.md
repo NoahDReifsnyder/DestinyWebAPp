@@ -285,6 +285,36 @@ authenticated, non-cacheable status endpoint and displays completed versus
 total actions, a measured time estimate, verification/retry stages, and an
 accessible progress bar. Reloading the page reconnects to an active job.
 
+## Armor cleaner
+
+The Armor 3.0 cleaner is available at `/cleaner/armor`. It discovers owned
+armor sets from Bungie's `DestinyEquipableItemSetDefinition`, resolves the
+official two-piece and four-piece bonus names and descriptions, and saves a
+policy for each signed-in user. Each set can remember accepted primary,
+secondary, and tertiary intrinsic stats, set-bonus interests, and a raid or
+non-raid classification. Raid and non-raid coverage can be combined or kept
+separate. Tuning alignment can be required, preferred as a deterministic
+tie-breaker, or ignored.
+
+Exotics are always kept. Legendary armor that is not Tier 5 or has intrinsic
+Health is tagged for review. Incidental displayed Health points and tuning
+changes do not count as intrinsic Health. Locked, equipped, and
+loadout-referenced armor receive no automatic protection. A user can mark an
+exact review candidate as **Keep**; that decision persists across analyses and
+inventory refreshes until removed.
+
+Without a selected set bonus, identical intrinsic roll coverage may be shared
+across armor sets according to the source policy. Selecting a two-piece or
+four-piece bonus gives that set its own coverage context and retains distinct
+slots needed for the bonus. An infeasible per-class obligation is displayed
+instead of silently discarding the requirement.
+
+After review, the armor organizer forces a fresh inventory sync and recomputes
+the saved policy before changing anything. It unlocks exact review candidates,
+locks retained armor, uses the owning character for carried or equipped items,
+and verifies every state with the same retry and second-refresh safeguards as
+the weapon organizer. It never dismantles, transfers, or equips armor.
+
 ## Current security boundary
 
 - Unsafe form submissions use session-bound CSRF tokens and same-origin checks.

@@ -617,45 +617,41 @@ Destiny after reviewing the recommendations.
 
 ### Armor cleaner increment
 
-Armor coverage is measured across usable build combinations rather than as an
-exact collection of individual rolls. The analyzer must find a retained set
-that preserves the user's chosen build possibilities while respecting a hard
-armor-storage budget.
+Armor coverage is measured across intrinsic Armor 3.0 rolls and selected set
+bonuses rather than a total storage budget. The analyzer retains useful Tier 5
+roll coverage and identifies exact overlapping instances for review.
 
 #### Stage 1: Audit and normalize armor data
 
 - Inventory every Armor 3.0 instance by class, slot, tier, archetype, source,
   armor set, set bonus, stat distribution, tuning socket, lock state, location,
   and loadout references.
-- Separate Exotics, class items, and legacy armor where their comparison rules
-  differ; never silently compare incompatible armor systems.
-- Resolve raid, dungeon, destination, world, seasonal, event, and other source
-  categories from manifest/activity data, with an explicit `unknown` category.
+- Always keep Exotics. Analyze class items and legacy armor under the same
+  visible Tier 5 and intrinsic-stat rules as other armor.
+- Classify armor sets as raid or non-raid, with a saved per-set override.
 - Present counts and missing-data warnings before making recommendations.
 
 #### Stage 2: Define a saved armor-cleaner policy
 
 - Select the classes and slots to analyze.
-- Set a total retained-item budget, with optional per-class and per-slot caps.
-- Exclude chosen stats from useful roll positions; Health can be excluded
-  without assuming that incidental points make an otherwise useful item bad.
-- Select desired stats and optional minimum build-stat targets.
+- Do not apply a total retained-item budget.
+- Treat Health as a hard exclusion only when it is one of the rolled intrinsic
+  primary, secondary, or tertiary stats; incidental displayed points do not
+  trigger the rule.
+- Save accepted primary, secondary, and tertiary stats independently for every
+  discovered armor set.
 - Configure tuning alignment as `required`, `preferred`, or `ignored`.
   Alignment means the tuned stat belongs to the item's accepted stat focus;
   the exact accepted positions must be visible in the policy.
-- Configure source-specific retention profiles. The initial defaults should
-  preserve more near-best raid armor, fewer dungeon alternatives, and only the
-  strongest destination/easy-to-refarm alternatives.
-- Allow each source profile to set a tier floor, score tolerance, and maximum
-  number of alternatives instead of embedding source behavior in code.
-- Configure required armor-set coverage: four-piece bonuses, two-plus-two set
-  combinations, selected sets only, or no set-bonus obligation.
-- Always protect equipped, locked, user-protected, and loadout-referenced armor
-  unless the user explicitly changes the applicable safety rule.
+- Let the user preserve raid and non-raid roll coverage separately or treat
+  both sources as one pool.
+- Configure two-piece and four-piece interest independently for each armor set,
+  using Bungie's set membership and bonus definitions.
+- Locked, equipped, and loadout-referenced states do not protect armor. An
+  exact-instance manual **Keep** decision made in the cleaner does protect it
+  and persists across refreshes until removed.
 
-Before implementation, manually approve the meanings of stat exclusion,
-tuning alignment, source categories, set-bonus obligations, and the storage
-budget. Policy changes must produce a preview and must not alter live items.
+Policy changes produce a saved preview and do not alter live items.
 
 #### Stage 3: Produce conservative, explainable candidates
 
@@ -665,14 +661,12 @@ budget. Policy changes must produce a preview and must not alter live items.
 - Define a coverage scenario from class, Exotic-slot assumption, legendary
   slots, required set-bonus pattern, desired stat targets, and tuning policy.
 - Measure every scenario against the full eligible collection as the benchmark.
-- Select the smallest retained set, or the best set within the configured
-  budget, that preserves the benchmark scenarios within their allowed score
-  tolerances.
+- Retain one deterministic representative of each accepted intrinsic roll
+  context, then promote distinct slots when selected set coverage requires it.
 - Use deterministic tie-breakers and prefer protected or expensive-to-replace
   pieces when otherwise equivalent.
-- If the requested coverage cannot fit the budget, report the conflict and rank
-  the scenarios that would be lost; never silently exceed the budget or discard
-  a requirement.
+- If owned Tier 5 non-Health armor cannot meet a selected set obligation,
+  report the per-class coverage conflict.
 - Explain every candidate as dominated, unused by any retained scenario, or
   excluded by a named policy rule, and identify the alternatives that preserve
   its coverage.
@@ -681,29 +675,28 @@ budget. Policy changes must produce a preview and must not alter live items.
 
 - Show kept and candidate armor by class and slot, with stat bars, tier,
   archetype, tuning alignment, armor set, source, protection state, and reason.
-- Show retained count versus budget, projected space recovered, and retained
-  four-piece and two-plus-two set coverage.
+- Show retained count, projected space recovered, and retained two-piece and
+  four-piece set coverage.
 - Compare full-inventory and retained-set results with scenario coverage rate,
   number of infeasible scenarios, and maximum and typical build-score loss.
 - Show retention counts by source so the selected raid, dungeon, and
   destination tolerances can be inspected.
 - Provide a policy sensitivity preview showing how many items and scenarios
   change when a rule is toggled.
-- Reuse the verified lock/unlock workflow only after the recommendations and
-  policy behavior have been manually accepted as a separate implementation
-  increment.
+- After review, offer the verified workflow that locks retained armor and
+  unlocks candidates, including equipped and loadout-referenced pieces.
 
 #### Armor verification gate
 
-- No candidate violates an enabled protected-item rule.
+- Exotics and exact-instance manual keeps are never candidates.
 - No retained item violates a hard excluded-stat or tuning-alignment rule.
-- Retained count does not exceed the configured budget.
+- Every retained legendary policy roll is Tier 5 unless manually kept.
 - The same snapshot and policy produce the same result.
 - Every lost scenario and every score reduction is visible.
 - Representative builds recreated from the retained set match the analyzer's
   feasibility result when checked in Destiny or DIM.
-- Tightening raid, dungeon, or destination tolerance changes only the expected
-  source categories and produces an understandable explanation.
+- Switching raid/non-raid treatment changes only the expected coverage pools
+  and produces an understandable explanation.
 - Toggling Health exclusion and tuning alignment produces the expected,
   manually reviewed change before either rule is trusted.
 
@@ -713,8 +706,8 @@ budget. Policy changes must produce a preview and must not alter live items.
 - The compared alternatives and scoring factors are visible.
 - Perk icons match Destiny and every perk description is reachable with both a
   pointer and keyboard.
-- Locked, protected, equipped, and loadout-referenced items are not recommended
-  under the default policy.
+- Exotics and cleaner manual keeps are not recommended. Locked, equipped, and
+  loadout-referenced legendary armor may be recommended.
 - Stale inventory produces a warning and requires refresh before a final review.
 - Re-running the same rules against the same snapshot is deterministic.
 - Changed inventory creates a new analysis rather than silently rewriting the

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 INVENTORY_HISTORY_LIMIT = 3
 CLEANER_HISTORY_LIMIT = 10
 
@@ -576,6 +576,34 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         BEGIN
             SELECT RAISE(ABORT, 'cleaner snapshot has the wrong owner');
         END;
+        """,
+    ),
+    (
+        7,
+        "saved armor cleaner policy and manual keeps",
+        """
+        CREATE TABLE armor_cleaner_policies (
+            bungie_membership_id TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            policy_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (bungie_membership_id)
+                REFERENCES users(bungie_membership_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE armor_manual_keeps (
+            bungie_membership_id TEXT NOT NULL,
+            item_instance_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (bungie_membership_id, item_instance_id),
+            FOREIGN KEY (bungie_membership_id)
+                REFERENCES users(bungie_membership_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_armor_manual_keeps_user
+            ON armor_manual_keeps(bungie_membership_id, created_at);
         """,
     ),
 )
@@ -1740,6 +1768,103 @@ class Database:
             "ruleset_version": ruleset_version,
             "result": result,
         }
+
+    def load_armor_cleaner_policy(
+        self,
+        bungie_membership_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT revision, policy_json, updated_at
+                FROM armor_cleaner_policies
+                WHERE bungie_membership_id = ?
+                """,
+                (bungie_membership_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        policy = json.loads(row["policy_json"])
+        if not isinstance(policy, dict):
+            raise ValueError("Stored armor cleaner policy is invalid.")
+        return {
+            "revision": int(row["revision"]),
+            "updated_at": row["updated_at"],
+            "policy": policy,
+        }
+
+    def save_armor_cleaner_policy(
+        self,
+        bungie_membership_id: str,
+        policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        updated_at = as_iso(utc_now())
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO armor_cleaner_policies (
+                    bungie_membership_id, revision, policy_json, updated_at
+                ) VALUES (?, 1, ?, ?)
+                ON CONFLICT(bungie_membership_id) DO UPDATE SET
+                    revision = armor_cleaner_policies.revision + 1,
+                    policy_json = excluded.policy_json,
+                    updated_at = excluded.updated_at
+                """,
+                (bungie_membership_id, compact_json(policy), updated_at),
+            )
+            row = connection.execute(
+                """
+                SELECT revision, updated_at
+                FROM armor_cleaner_policies
+                WHERE bungie_membership_id = ?
+                """,
+                (bungie_membership_id,),
+            ).fetchone()
+        return {
+            "revision": int(row["revision"]),
+            "updated_at": row["updated_at"],
+            "policy": policy,
+        }
+
+    def armor_manual_keeps(self, bungie_membership_id: str) -> set[str]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT item_instance_id
+                FROM armor_manual_keeps
+                WHERE bungie_membership_id = ?
+                """,
+                (bungie_membership_id,),
+            ).fetchall()
+        return {str(row["item_instance_id"]) for row in rows}
+
+    def set_armor_manual_keep(
+        self,
+        bungie_membership_id: str,
+        item_instance_id: str,
+        *,
+        keep: bool,
+    ) -> None:
+        with self.connection() as connection:
+            if keep:
+                connection.execute(
+                    """
+                    INSERT INTO armor_manual_keeps (
+                        bungie_membership_id, item_instance_id, created_at
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(bungie_membership_id, item_instance_id)
+                    DO NOTHING
+                    """,
+                    (bungie_membership_id, item_instance_id, as_iso(utc_now())),
+                )
+            else:
+                connection.execute(
+                    """
+                    DELETE FROM armor_manual_keeps
+                    WHERE bungie_membership_id = ? AND item_instance_id = ?
+                    """,
+                    (bungie_membership_id, item_instance_id),
+                )
 
     def latest_cleaner_analysis(
         self,

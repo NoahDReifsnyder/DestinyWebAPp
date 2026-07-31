@@ -13,6 +13,8 @@ from aiohttp.abc import AbstractAccessLogger
 
 from destiny_web_app import __version__
 from destiny_web_app.app_keys import (
+    ARMOR_CLEANER_SERVICE_KEY,
+    ARMOR_ORGANIZER_SERVICE_KEY,
     AUTH_SESSION_KEY,
     AUTH_WARNING_KEY,
     BUNGIE_CLIENT_KEY,
@@ -23,6 +25,15 @@ from destiny_web_app.app_keys import (
     TOKEN_REFRESH_LOCKS_KEY,
     WEAPON_CLEANER_SERVICE_KEY,
     WEAPON_ORGANIZER_SERVICE_KEY,
+)
+from destiny_web_app.armor_cleaner import ArmorCleanerService
+from destiny_web_app.armor_cleaner_routes import (
+    analyze_armor,
+    armor_cleaner_page,
+    armor_organization_status,
+    organize_armor,
+    save_armor_policy,
+    set_armor_manual_keep,
 )
 from destiny_web_app.auth import (
     auth_status,
@@ -56,7 +67,7 @@ from destiny_web_app.inventory_routes import (
     synchronize_manifest,
 )
 from destiny_web_app.manifest import ManifestService
-from destiny_web_app.organizer import WeaponOrganizerService
+from destiny_web_app.organizer import ArmorOrganizerService, WeaponOrganizerService
 
 
 LOGGER = logging.getLogger(__name__)
@@ -95,6 +106,10 @@ def create_app(settings: Settings | None = None) -> web.Application:
         language=settings.manifest_language,
     )
     app[MANIFEST_SERVICE_KEY] = manifest_service
+    app[ARMOR_CLEANER_SERVICE_KEY] = ArmorCleanerService(
+        database,
+        manifest_service,
+    )
     app[WEAPON_CLEANER_SERVICE_KEY] = WeaponCleanerService(
         database,
         manifest_service,
@@ -105,6 +120,13 @@ def create_app(settings: Settings | None = None) -> web.Application:
         app[INVENTORY_SERVICE_KEY],
         manifest_service,
         app[WEAPON_CLEANER_SERVICE_KEY],
+    )
+    app[ARMOR_ORGANIZER_SERVICE_KEY] = ArmorOrganizerService(
+        database,
+        bungie,
+        app[INVENTORY_SERVICE_KEY],
+        manifest_service,
+        app[ARMOR_CLEANER_SERVICE_KEY],
     )
     app.add_routes(
         [
@@ -132,6 +154,15 @@ def create_app(settings: Settings | None = None) -> web.Application:
             web.get(
                 "/cleaner/weapons/organize/status",
                 weapon_organization_status,
+            ),
+            web.get("/cleaner/armor", armor_cleaner_page),
+            web.post("/cleaner/armor/policy", save_armor_policy),
+            web.post("/cleaner/armor/analyze", analyze_armor),
+            web.post("/cleaner/armor/keep", set_armor_manual_keep),
+            web.post("/cleaner/armor/organize", organize_armor),
+            web.get(
+                "/cleaner/armor/organize/status",
+                armor_organization_status,
             ),
         ]
     )
@@ -173,7 +204,8 @@ async def home(request: web.Request) -> web.Response:
   refresh automatically before they expire.</p>
   <p><a href="/auth/status">View non-secret session status</a></p>
   <p><a class="button" href="/inventory">Open inventory</a></p>
-  <p><a href="/cleaner/weapons">Open weapon cleaner</a></p>
+  <p><a href="/cleaner/weapons">Open weapon cleaner</a> ·
+  <a href="/cleaner/armor">Open armor cleaner</a></p>
   <p><a href="/data/status">Inventory and database status</a></p>
   {warning_html}
   <form method="post" action="/auth/logout">

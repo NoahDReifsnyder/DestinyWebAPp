@@ -1,4 +1,4 @@
-"""Verified Bungie lock-state organization for weapon cleanup."""
+"""Verified Bungie lock-state organization for cleaner reviews."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from destiny_web_app.bungie import (
     BungieError,
     BungieTemporarilyUnavailable,
 )
+from destiny_web_app.armor_cleaner import ArmorCleanerService
 from destiny_web_app.cleaner import WeaponCleanerService
 from destiny_web_app.database import Database
 from destiny_web_app.inventory import InventoryService
@@ -76,13 +77,20 @@ class WeaponOrganizerService:
         bungie: BungieClient,
         inventory: InventoryService,
         manifest: ManifestService,
-        cleaner: WeaponCleanerService,
+        cleaner: WeaponCleanerService | ArmorCleanerService,
+        *,
+        item_type: int = 3,
+        label: str = "weapon",
+        vault_only: bool = True,
     ) -> None:
         self.database = database
         self.bungie = bungie
         self.inventory = inventory
         self.manifest = manifest
         self.cleaner = cleaner
+        self.item_type = item_type
+        self.label = label
+        self.vault_only = vault_only
         self._locks: dict[str, asyncio.Lock] = {}
         self._jobs: dict[str, WeaponOrganizerProgress] = {}
         self._tasks: set[asyncio.Task[None]] = set()
@@ -91,7 +99,8 @@ class WeaponOrganizerService:
         current = self._jobs.get(bungie_membership_id)
         if current and current.status not in {"complete", "partial", "failed"}:
             raise WeaponOrganizerError(
-                "Weapon organization is already running for this account."
+                f"{self.label.title()} organization is already running for "
+                "this account."
             )
         progress = WeaponOrganizerProgress(started_at=time.monotonic())
         self._jobs[bungie_membership_id] = progress
@@ -119,13 +128,13 @@ class WeaponOrganizerService:
             )
         except Exception as error:
             progress.status = "failed"
-            progress.message = "Weapon organization stopped."
+            progress.message = f"{self.label.title()} organization stopped."
             progress.error = " ".join(str(error).split())[:300]
         else:
             progress.result = result
             progress.status = "partial" if result.failed_count else "complete"
             progress.message = (
-                f"Verified {result.verified_count} weapons; "
+                f"Verified {result.verified_count} {self.label} items; "
                 f"{result.failed_count} still need attention."
                 if result.failed_count
                 else (
@@ -147,7 +156,8 @@ class WeaponOrganizerService:
         )
         if operation_lock.locked():
             raise WeaponOrganizerError(
-                "Weapon organization is already running for this account."
+                f"{self.label.title()} organization is already running for "
+                "this account."
             )
         async with operation_lock:
             return await self._organize(
@@ -183,7 +193,8 @@ class WeaponOrganizerService:
             or analysis["snapshot_id"] != source["snapshot"]["snapshot_id"]
         ):
             raise WeaponOrganizerError(
-                "The inventory changed before weapon organization could start."
+                f"The inventory changed before {self.label} organization "
+                "could start."
             )
 
         item_definitions = await asyncio.to_thread(
@@ -197,37 +208,47 @@ class WeaponOrganizerService:
             for item in group["items"]
             if item["decision"] == "candidate"
         }
-        weapons = [
+        organized_items = [
             item
             for item in source["items"]
-            if item["source_kind"] == "vault"
+            if (not self.vault_only or item["source_kind"] == "vault")
             and item.get("item_instance_id")
             and bool(item.get("lockable"))
-            and item_definitions.get(item["item_hash"], {}).get("itemType") == 3
+            and item_definitions.get(item["item_hash"], {}).get("itemType")
+            == self.item_type
         ]
-        weapon_row_ids = {item["id"] for item in weapons}
-        if not candidate_row_ids <= weapon_row_ids:
+        organized_row_ids = {item["id"] for item in organized_items}
+        if not candidate_row_ids <= organized_row_ids:
             raise WeaponOrganizerError(
-                "One or more review candidates are no longer lockable vault weapons."
+                f"One or more review candidates are no longer lockable "
+                f"{self.label} items."
             )
-        character_id = first_character_id(source)
+        fallback_character_id = first_character_id(source)
         membership_type = source["snapshot"].get("membership_type")
         if not isinstance(membership_type, int):
             raise WeaponOrganizerError("The Destiny membership type is unavailable.")
 
         desired_by_instance = {
             item["item_instance_id"]: item["id"] not in candidate_row_ids
-            for item in weapons
+            for item in organized_items
+        }
+        character_by_instance = {
+            item["item_instance_id"]: (
+                str(item["character_id"])
+                if item.get("character_id")
+                else fallback_character_id
+            )
+            for item in organized_items
         }
         actions = [
             item
-            for item in weapons
+            for item in organized_items
             if bool(item["state"] & 1)
             != desired_by_instance[item["item_instance_id"]]
         ]
         if progress:
             progress.status = "running"
-            progress.message = "Applying weapon lock states…"
+            progress.message = f"Applying {self.label} lock states…"
             progress.total = len(actions)
         consecutive_errors = 0
         for item in actions:
@@ -237,7 +258,7 @@ class WeaponOrganizerService:
                 await self._set_with_retry(
                     access_token=access_token,
                     item_instance_id=instance_id,
-                    character_id=character_id,
+                    character_id=character_by_instance[instance_id],
                     membership_type=membership_type,
                     locked=desired_locked,
                 )
@@ -295,7 +316,7 @@ class WeaponOrganizerService:
                     await self._set_with_retry(
                         access_token=access_token,
                         item_instance_id=instance_id,
-                        character_id=character_id,
+                        character_id=character_by_instance[instance_id],
                         membership_type=membership_type,
                         locked=desired_by_instance[instance_id],
                     )
@@ -337,13 +358,13 @@ class WeaponOrganizerService:
         await asyncio.to_thread(self.cleaner.analyze, bungie_membership_id)
         return WeaponOrganizerResult(
             candidate_count=len(candidate_row_ids),
-            keeper_count=len(weapons) - len(candidate_row_ids),
+            keeper_count=len(organized_items) - len(candidate_row_ids),
             changed_count=sum(
                 actual_by_instance.get(item["item_instance_id"])
                 == desired_by_instance[item["item_instance_id"]]
                 for item in actions
             ),
-            already_correct_count=len(weapons) - len(actions),
+            already_correct_count=len(organized_items) - len(actions),
             verified_count=len(desired_by_instance) - len(mismatches),
             failed_count=len(mismatches),
         )
@@ -372,6 +393,27 @@ class WeaponOrganizerService:
                 if attempt >= len(RETRY_DELAYS):
                     raise
                 await asyncio.sleep(RETRY_DELAYS[attempt])
+
+
+class ArmorOrganizerService(WeaponOrganizerService):
+    def __init__(
+        self,
+        database: Database,
+        bungie: BungieClient,
+        inventory: InventoryService,
+        manifest: ManifestService,
+        cleaner: ArmorCleanerService,
+    ) -> None:
+        super().__init__(
+            database,
+            bungie,
+            inventory,
+            manifest,
+            cleaner,
+            item_type=2,
+            label="armor",
+            vault_only=False,
+        )
 
 
 def first_character_id(source: dict[str, Any]) -> str:

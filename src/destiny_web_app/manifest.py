@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 import zipfile
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +25,7 @@ REQUIRED_TABLES = {
 }
 MAX_UNPACKED_MANIFEST_BYTES = 2 * 1024 * 1024 * 1024
 ALLOWED_TABLES = REQUIRED_TABLES | {
+    "DestinyEquipableItemSetDefinition",
     "DestinyPlugSetDefinition",
     "DestinyItemCategoryDefinition",
 }
@@ -192,6 +194,12 @@ class ManifestService:
                 if item_hash in table_cache
             }
 
+    def resolve_all(self, table: str) -> dict[int, dict[str, Any]]:
+        status = self.status()
+        if not status["available"]:
+            raise ManifestError("The local Destiny definitions are unavailable.")
+        return ManifestRepository(self.path).resolve_all(table)
+
 
 class ManifestRepository:
     def __init__(self, path: Path) -> None:
@@ -214,7 +222,7 @@ class ManifestRepository:
 
         resolved: dict[int, dict[str, Any]] = {}
         try:
-            with manifest_connection(self.path) as connection:
+            with closing(manifest_connection(self.path)) as connection:
                 for start in range(0, len(unique_hashes), 500):
                     batch = unique_hashes[start : start + 500]
                     signed = [signed_hash(value) for value in batch]
@@ -238,6 +246,28 @@ class ManifestRepository:
             ) from error
         return resolved
 
+    def resolve_all(self, table: str) -> dict[int, dict[str, Any]]:
+        if table not in ALLOWED_TABLES:
+            raise ValueError(f"Unsupported manifest table: {table}")
+        resolved: dict[int, dict[str, Any]] = {}
+        try:
+            with closing(manifest_connection(self.path)) as connection:
+                rows = connection.execute(
+                    f'SELECT id, json FROM "{table}"'
+                ).fetchall()
+                for row in rows:
+                    try:
+                        payload = json.loads(row["json"])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict):
+                        resolved[unsigned_hash(row["id"])] = payload
+        except sqlite3.Error as error:
+            raise ManifestError(
+                "The local Destiny definitions could not be read."
+            ) from error
+        return resolved
+
 
 def manifest_signature(path: Path) -> tuple[int, int]:
     try:
@@ -251,7 +281,7 @@ def validate_manifest_schema(path: Path) -> None:
     if not path.is_file():
         raise ManifestError("The local Destiny manifest is missing.")
     try:
-        with manifest_connection(path) as connection:
+        with closing(manifest_connection(path)) as connection:
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -304,7 +334,7 @@ def unpack_manifest(download_path: Path, destination: Path) -> None:
 def validate_manifest(path: Path) -> None:
     validate_manifest_schema(path)
     try:
-        with manifest_connection(path) as connection:
+        with closing(manifest_connection(path)) as connection:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     except sqlite3.Error as error:
         raise ManifestError("The local Destiny manifest is not valid SQLite.") from error

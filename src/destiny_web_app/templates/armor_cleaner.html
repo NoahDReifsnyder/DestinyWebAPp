@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#090d12">
-    <title>Weapon cleaner · Destiny Web App</title>
+    <title>Armor cleaner · Destiny Web App</title>
     <link rel="stylesheet" href="/static/cleaner.css">
   </head>
   <body>
@@ -12,8 +12,8 @@
       <a class="brand" href="/">Destiny Web App</a>
       <nav>
         <a href="/inventory">Inventory</a>
-        <a class="active" href="/cleaner/weapons">Weapons</a>
-        <a href="/cleaner/armor">Armor</a>
+        <a href="/cleaner/weapons">Weapons</a>
+        <a class="active" href="/cleaner/armor">Armor</a>
         <a href="/data/status">Data status</a>
       </nav>
       <span class="guardian">$guardian_name</span>
@@ -21,31 +21,31 @@
     <main>
       <section class="hero">
         <div>
-          <p class="eyebrow">Vault cleaning assistant · Weapons</p>
-          <h1>Preserve the options.<br><em>Remove the overlap.</em></h1>
-          <p>This page recommends exact copies for review. It cannot dismantle,
-          transfer, unlock, or equip anything.</p>
+          <p class="eyebrow">Vault cleaning assistant · Armor 3.0</p>
+          <h1>Keep the builds.<br><em>Review the overlap.</em></h1>
+          <p>Configure useful intrinsic rolls per armor set, preserve selected
+          bonuses, and manually keep any exact item before applying locks.</p>
         </div>
         <div class="hero-actions">
-          <form method="post" action="/cleaner/weapons/analyze">
+          <form method="post" action="/cleaner/armor/analyze">
             $analyze_csrf
             <button type="submit">Analyze current inventory</button>
           </form>
-          <form id="organize-weapons" method="post"
-                action="/cleaner/weapons/organize">
+          <form id="organize-armor" method="post"
+                action="/cleaner/armor/organize">
             $organize_csrf
             <button class="danger" type="submit">
               Lock keepers &amp; unlock candidates
             </button>
           </form>
-          <small>Organization refreshes and re-analyzes first, may take several
-          minutes, and verifies every resulting lock state.</small>
+          <small>Organization refreshes and re-analyzes first, applies only
+          lock states, and verifies every exact item afterward.</small>
         </div>
       </section>
       <section id="organize-progress" class="organize-progress" hidden
                aria-live="polite">
         <div class="progress-heading">
-          <strong id="progress-message">Preparing weapon organization…</strong>
+          <strong id="progress-message">Preparing armor organization…</strong>
           <span id="progress-count">Preparing</span>
         </div>
         <div class="progress-track" role="progressbar" aria-valuemin="0"
@@ -61,8 +61,9 @@
       $error
       $current_warning
       $stale_warning
+      $policy_form
       $body
     </main>
-    <script src="/static/cleaner.js" defer></script>
+    <script src="/static/armor_cleaner.js" defer></script>
   </body>
 </html>

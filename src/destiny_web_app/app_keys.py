@@ -4,13 +4,14 @@ import asyncio
 
 from aiohttp import web
 
+from destiny_web_app.armor_cleaner import ArmorCleanerService
 from destiny_web_app.bungie import BungieClient
 from destiny_web_app.cleaner import WeaponCleanerService
 from destiny_web_app.config import Settings
 from destiny_web_app.database import AuthenticatedSession, Database
 from destiny_web_app.inventory import InventoryService
 from destiny_web_app.manifest import ManifestService
-from destiny_web_app.organizer import WeaponOrganizerService
+from destiny_web_app.organizer import ArmorOrganizerService, WeaponOrganizerService
 
 
 SETTINGS_KEY = web.AppKey("settings", Settings)
@@ -20,6 +21,14 @@ AUTH_SESSION_KEY = web.AppKey("authenticated_session", AuthenticatedSession)
 AUTH_WARNING_KEY = web.AppKey("authentication_warning", str)
 INVENTORY_SERVICE_KEY = web.AppKey("inventory_service", InventoryService)
 MANIFEST_SERVICE_KEY = web.AppKey("manifest_service", ManifestService)
+ARMOR_CLEANER_SERVICE_KEY = web.AppKey(
+    "armor_cleaner_service",
+    ArmorCleanerService,
+)
+ARMOR_ORGANIZER_SERVICE_KEY = web.AppKey(
+    "armor_organizer_service",
+    ArmorOrganizerService,
+)
 WEAPON_CLEANER_SERVICE_KEY = web.AppKey(
     "weapon_cleaner_service",
     WeaponCleanerService,
