@@ -207,6 +207,19 @@ def normalize_policy(
     tuning_mode = value.get("tuning_mode")
     if tuning_mode not in {"required", "preferred", "ignored"}:
         tuning_mode = "preferred"
+    preferred_tuning_raw = value.get("preferred_tuning")
+    if isinstance(preferred_tuning_raw, str):
+        preferred_tuning = (
+            [preferred_tuning_raw]
+            if preferred_tuning_raw in ARMOR_STAT_NAMES
+            else []
+        )
+    elif isinstance(preferred_tuning_raw, list):
+        preferred_tuning = [
+            name for name in ARMOR_STAT_NAMES if name in preferred_tuning_raw
+        ]
+    else:
+        preferred_tuning = []
     raw_sets = value.get("sets")
     if not isinstance(raw_sets, dict):
         raw_sets = {}
@@ -223,10 +236,8 @@ def normalize_policy(
                 if raw.get("source") in {"raid", "nonraid"}
                 else catalog["default_source"]
             ),
-            "two_piece": bool(raw.get("two_piece", False))
-            and bool(catalog["bonuses"].get("2")),
-            "four_piece": bool(raw.get("four_piece", False))
-            and bool(catalog["bonuses"].get("4")),
+            "two_piece": False,
+            "four_piece": False,
             "primary": accepted_stats(raw.get("primary")),
             "secondary": accepted_stats(raw.get("secondary")),
             "tertiary": accepted_stats(raw.get("tertiary")),
@@ -234,7 +245,8 @@ def normalize_policy(
     return {
         "source_mode": source_mode,
         "tuning_mode": tuning_mode,
-        "excluded_stats": ["Health"],
+        "preferred_tuning": preferred_tuning,
+        "excluded_stats": [],
         "sets": policies,
     }
 
@@ -242,8 +254,7 @@ def normalize_policy(
 def accepted_stats(value: Any) -> list[str]:
     if not isinstance(value, list):
         return list(DEFAULT_ACCEPTED_STATS)
-    selected = [name for name in ARMOR_STAT_NAMES if name in value]
-    return [name for name in selected if name != "Health"]
+    return [name for name in ARMOR_STAT_NAMES if name in value]
 
 
 def build_set_catalog(
@@ -324,6 +335,15 @@ def analyze_armor(
     manual_keeps: set[str],
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
+    preferred_tuning = policy.get("preferred_tuning")
+    if isinstance(preferred_tuning, str):
+        preferred_tuning_stats = {preferred_tuning}
+    elif isinstance(preferred_tuning, list):
+        preferred_tuning_stats = {
+            name for name in preferred_tuning if name in ARMOR_STAT_NAMES
+        }
+    else:
+        preferred_tuning_stats = set()
     set_by_item = {
         item_hash: set_hash
         for set_hash, catalog in set_catalog.items()
@@ -371,11 +391,6 @@ def analyze_armor(
                 "candidate", "Armor set is not selected"
             )
             continue
-        if "Health" in item["intrinsic_stats"]:
-            decisions[item["item_row_id"]] = decision(
-                "candidate", "Intrinsic Health is excluded"
-            )
-            continue
         mismatch = next(
             (
                 position
@@ -394,40 +409,37 @@ def analyze_armor(
             + set_policy["secondary"]
             + set_policy["tertiary"]
         )
-        item["tuning_aligned"] = (
-            item["tuned_stat"] in accepted_focus
-            if item["tuned_stat"]
-            else False
-        )
+        if preferred_tuning_stats:
+            item["tuning_aligned"] = item["tuned_stat"] in preferred_tuning_stats
+        else:
+            item["tuning_aligned"] = (
+                item["tuned_stat"] in accepted_focus
+                if item["tuned_stat"]
+                else False
+            )
         if mismatch:
             decisions[item["item_row_id"]] = decision(
                 "candidate", f"{mismatch.title()} stat is not selected"
             )
             continue
         if policy["tuning_mode"] == "required" and not item["tuning_aligned"]:
+            reason = "Tuning does not match the preferred slots"
+            if not preferred_tuning_stats:
+                reason = "Tuning is not aligned with selected stats"
             decisions[item["item_row_id"]] = decision(
-                "candidate", "Tuning is not aligned with selected stats"
+                "candidate", reason
             )
             continue
         eligible.append(item)
 
     duplicate_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for item in eligible:
-        set_policy = policy["sets"][str(item["set_hash"])]
-        coverage_context: str | int = (
-            item["set_hash"]
-            if set_policy["two_piece"] or set_policy["four_piece"]
-            else (
-                set_policy["source"]
-                if policy["source_mode"] == "separate"
-                else "all-sources"
-            )
-        )
+        # Armor pieces can only replace other pieces from the same set.
         duplicate_groups[
             (
+                item["set_hash"],
                 item["class_type"],
                 item["slot"],
-                coverage_context,
                 tuple(item["intrinsic_stats"]),
             )
         ].append(item)
@@ -512,8 +524,6 @@ def apply_set_coverage(
     by_set_class: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
     for item in armor:
         if item["exotic"] or item["gear_tier"] != 5:
-            continue
-        if "Health" in item["intrinsic_stats"]:
             continue
         by_set_class[(item["set_hash"], item["class_type"])].append(item)
     for (set_hash, _class_type), items in by_set_class.items():

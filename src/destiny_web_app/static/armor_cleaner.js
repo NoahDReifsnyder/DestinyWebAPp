@@ -8,6 +8,9 @@ const progressMessage = document.querySelector("#progress-message");
 const progressCount = document.querySelector("#progress-count");
 const progressStage = document.querySelector("#progress-stage");
 const progressEta = document.querySelector("#progress-eta");
+const policyForm = document.querySelector(".armor-policy");
+
+const statFields = ["weapons", "health", "class", "grenade", "super", "melee"];
 
 organizeForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -119,3 +122,69 @@ async function resumeActiveProgress() {
 }
 
 resumeActiveProgress();
+
+if (policyForm) {
+  const globalInterested = policyForm.querySelector("input[name='global_interested']");
+  const globalIncludeRaid = policyForm.querySelector("input[name='global_include_raid']");
+  const globalStats = statFields
+    .map((field) => policyForm.querySelector(`input[name='global_stats_${field}']`))
+    .filter(Boolean);
+  const setCards = [...policyForm.querySelectorAll(".set-policy")];
+
+  const syncSetCard = (card) => {
+    const prefix = card.dataset.prefix;
+    if (!prefix) return;
+    const customToggle = card.querySelector("[data-role='set-custom-toggle']");
+    const controls = card.querySelector("[data-role='set-advanced-controls']");
+    if (!customToggle || !controls) return;
+
+    const custom = customToggle.checked;
+    controls.querySelectorAll("input, select").forEach((control) => {
+      control.disabled = !custom;
+    });
+    card.classList.toggle("set-follows-simple", !custom);
+
+    if (custom) return;
+
+    const interested = controls.querySelector(`input[name='${prefix}_interested']`);
+    const isRaid = card.dataset.raid === "1";
+    const raidAllowed = !isRaid || !globalIncludeRaid || globalIncludeRaid.checked;
+
+    if (interested && globalInterested) {
+      interested.checked = globalInterested.checked && raidAllowed;
+    }
+
+    ["primary", "secondary", "tertiary"].forEach((position) => {
+      statFields.forEach((field, index) => {
+        const setStat = controls.querySelector(
+          `input[name='${prefix}_${position}_${field}']`,
+        );
+        const globalStat = globalStats[index];
+        if (setStat && globalStat) {
+          setStat.checked = globalStat.checked;
+        }
+      });
+    });
+  };
+
+  const syncAllCards = () => {
+    setCards.forEach(syncSetCard);
+  };
+
+  policyForm
+    .querySelectorAll(
+      "input[name='global_interested'], input[name='global_include_raid'], " +
+        "input[name^='global_stats_']",
+    )
+    .forEach((input) => {
+      input.addEventListener("change", syncAllCards);
+    });
+
+  setCards.forEach((card) => {
+    const customToggle = card.querySelector("[data-role='set-custom-toggle']");
+    if (!customToggle) return;
+    customToggle.addEventListener("change", () => syncSetCard(card));
+  });
+
+  syncAllCards();
+}
