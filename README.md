@@ -90,8 +90,8 @@ The local HTTPS server introduced in Goal 2 will use the existing development
 certificate pair:
 
 ```text
-../DestinyWebAPp/webApp/util/CERT.pem
-../DestinyWebAPp/webApp/util/KEY.pem
+util/CERT.pem
+util/KEY.pem
 ```
 
 Their locations are configured by `DESTINY_SSL_CERT_PATH` and

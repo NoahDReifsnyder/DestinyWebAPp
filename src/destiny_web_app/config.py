@@ -42,11 +42,11 @@ class Settings:
             port=_read_port(os.getenv("DESTINY_PORT", "42697")),
             ssl_certificate=_read_path(
                 "DESTINY_SSL_CERT_PATH",
-                "../DestinyWebAPp/webApp/util/CERT.pem",
+                "util/CERT.pem",
             ),
             ssl_key=_read_path(
                 "DESTINY_SSL_KEY_PATH",
-                "../DestinyWebAPp/webApp/util/KEY.pem",
+                "util/KEY.pem",
             ),
             database_path=_read_path(
                 "DESTINY_DATABASE_PATH",
