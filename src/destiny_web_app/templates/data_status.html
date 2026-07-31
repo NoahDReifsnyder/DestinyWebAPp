@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Saved data status · Destiny Web App</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: system-ui, sans-serif;
+        background: #0d1118;
+        color: #edf3fa;
+      }
+
+      * { box-sizing: border-box; }
+      body { margin: 0; }
+      main { width: min(76rem, calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0 4rem; }
+      a { color: #8ec5ff; }
+      h1 { margin-bottom: 0.3rem; }
+      h2 { margin-top: 0; font-size: 1.15rem; }
+      .subtitle { color: #9cadc1; margin-top: 0; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1rem; }
+      .card { margin-top: 1rem; padding: 1.2rem; border: 1px solid #2d3a4d; border-radius: 0.8rem; background: #151d28; overflow-x: auto; }
+      .status { display: inline-block; padding: 0.25rem 0.65rem; border-radius: 999px; font-weight: 750; text-transform: uppercase; font-size: 0.75rem; }
+      .status.fresh, .pass { color: #75e8a1; }
+      .status.fresh { background: #123b29; }
+      .status.stale { background: #4b3510; color: #ffd275; }
+      .status.failed, .status.missing { background: #4a2026; color: #ff9ba6; }
+      .fail, .error { color: #ff9ba6; }
+      .notice { color: #75e8a1; }
+      dl { display: grid; grid-template-columns: minmax(8rem, max-content) 1fr; gap: 0.45rem 1rem; margin: 0; }
+      dt { color: #91a2b7; }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 0.65rem; border-bottom: 1px solid #2d3a4d; text-align: left; white-space: nowrap; }
+      th { color: #aebdd0; font-size: 0.8rem; text-transform: uppercase; }
+      .empty { color: #91a2b7; text-align: center; }
+      .actions { display: flex; flex-wrap: wrap; gap: 0.65rem; }
+      button { padding: 0.65rem 0.9rem; border: 0; border-radius: 0.45rem; background: #2878d0; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+      button.secondary { background: #45566d; }
+      button.danger { background: #9b3440; }
+      code { font-size: 0.85em; }
+      nav { display: flex; gap: 1rem; }
+      @media (max-width: 40rem) {
+        main { width: min(100% - 1rem, 76rem); padding-top: 1rem; }
+        dl { grid-template-columns: 1fr; gap: 0.2rem; }
+        dd { margin-bottom: 0.6rem; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <nav><a href="/">Home</a><a href="/data/status.json">JSON status</a></nav>
+      <h1>Saved data status</h1>
+      <p class="subtitle">$bungie_name · inventory and persistence verification</p>
+      <span class="status $status_class">$sync_status</span>
+      $notice
+      $error
+
+      <section class="card">
+        <h2>Inventory synchronization</h2>
+        <div class="actions">
+          <form method="post" action="/data/inventory/sync">
+            $csrf_sync
+            <button type="submit">Use cache or synchronize if stale</button>
+          </form>
+          <form method="post" action="/data/inventory/sync">
+            $csrf_sync
+            <input type="hidden" name="force" value="true">
+            <button class="secondary" type="submit">Force Bungie refresh</button>
+          </form>
+        </div>
+      </section>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Database</h2>
+          <dl>
+            <dt>Schema</dt><dd>$schema_version / expected $expected_schema_version</dd>
+            <dt>Last migration</dt><dd>$last_migration</dd>
+            <dt>Integrity</dt><dd>$integrity</dd>
+            <dt>File size</dt><dd>$database_size</dd>
+            <dt>Status read</dt><dd>$read_duration ms</dd>
+            <dt>Browser sessions</dt><dd>Opaque IDs; SHA-256 hashes stored</dd>
+            <dt>OAuth tokens</dt><dd>Server-side, owner-only SQLite; plaintext at rest during local development</dd>
+          </dl>
+        </section>
+        <section class="card">
+          <h2>Destiny account</h2>
+          <dl>
+            <dt>Name</dt><dd>$destiny_display_name</dd>
+            <dt>Membership ID</dt><dd><code>$destiny_membership</code></dd>
+            <dt>Membership type</dt><dd>$membership_type</dd>
+          </dl>
+        </section>
+        <section class="card">
+          <h2>Freshness</h2>
+          <dl>
+            <dt>Last attempt</dt><dd>$last_attempt</dd>
+            <dt>Last success</dt><dd>$last_success</dd>
+            <dt>Stale after</dt><dd>$stale_at</dd>
+            <dt>Bungie fetches</dt><dd>$api_fetch_count</dd>
+            <dt>Cache hits</dt><dd>$cache_hit_count</dd>
+            <dt>Last error</dt><dd>$last_error</dd>
+          </dl>
+        </section>
+        <section class="card">
+          <h2>Active snapshot</h2>
+          <dl>
+            <dt>Snapshot ID</dt><dd><code>$snapshot_id</code></dd>
+            <dt>Bungie minted</dt><dd>$source_minted_at</dd>
+            <dt>Total stored</dt><dd>$total_items</dd>
+            <dt>Vault</dt><dd>$vault_items</dd>
+            <dt>Other profile inventory</dt><dd>$profile_items</dd>
+            <dt>Character carried</dt><dd>$carried_items</dd>
+            <dt>Equipped</dt><dd>$equipped_items</dd>
+            <dt>Postmaster</dt><dd>$postmaster_items</dd>
+            <dt>Calculated total</dt><dd>$calculated_total <strong class="$totals_class">$totals_result</strong></dd>
+            <dt>Duplicate instances</dt><dd>$duplicate_instances</dd>
+            <dt>Broken owners</dt><dd>$broken_owners</dd>
+          </dl>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>Characters</h2>
+        <table>
+          <thead><tr><th>Class</th><th>Character ID</th><th>Power</th><th>Carried</th><th>Equipped</th><th>Postmaster</th></tr></thead>
+          <tbody>$character_rows</tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>Flexible cached resources</h2>
+        <table>
+          <thead><tr><th>Type</th><th>Key</th><th>Status</th><th>Fetched</th></tr></thead>
+          <tbody>$resource_rows</tbody>
+        </table>
+      </section>
+
+      $development_controls
+    </main>
+  </body>
+</html>

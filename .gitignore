@@ -1,4 +1,33 @@
-*.json
-*pycache*
-!devcontainer.json
-dwa
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments
+.DesintyWebAppVenv/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+instance/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

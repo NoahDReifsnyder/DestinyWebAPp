@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090d12">
+    <title>Weapon cleaner · Destiny Web App</title>
+    <link rel="stylesheet" href="/static/cleaner.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">Destiny Web App</a>
+      <nav>
+        <a href="/inventory">Inventory</a>
+        <a class="active" href="/cleaner/weapons">Weapon cleaner</a>
+        <a href="/data/status">Data status</a>
+      </nav>
+      <span class="guardian">$guardian_name</span>
+    </header>
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Vault cleaning assistant · Weapons</p>
+          <h1>Preserve the options.<br><em>Remove the overlap.</em></h1>
+          <p>This page recommends exact copies for review. It cannot dismantle,
+          transfer, unlock, or equip anything.</p>
+        </div>
+        <div class="hero-actions">
+          <form method="post" action="/cleaner/weapons/analyze">
+            $analyze_csrf
+            <button type="submit">Analyze current inventory</button>
+          </form>
+          <form id="organize-weapons" method="post"
+                action="/cleaner/weapons/organize">
+            $organize_csrf
+            <button class="danger" type="submit">
+              Lock keepers &amp; unlock candidates
+            </button>
+          </form>
+          <small>Organization refreshes and re-analyzes first, may take several
+          minutes, and verifies every resulting lock state.</small>
+        </div>
+      </section>
+      <section id="organize-progress" class="organize-progress" hidden
+               aria-live="polite">
+        <div class="progress-heading">
+          <strong id="progress-message">Preparing weapon organization…</strong>
+          <span id="progress-count">Preparing</span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0"
+             aria-valuemax="100" aria-valuenow="0">
+          <span id="progress-fill"></span>
+        </div>
+        <div class="progress-meta">
+          <span id="progress-stage">Refreshing inventory</span>
+          <span id="progress-eta">Estimating time remaining…</span>
+        </div>
+      </section>
+      $notice
+      $error
+      $current_warning
+      $stale_warning
+      $body
+    </main>
+    <script src="/static/cleaner.js" defer></script>
+  </body>
+</html>

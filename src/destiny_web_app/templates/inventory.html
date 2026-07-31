@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090d12">
+    <title>Inventory · Destiny Web App</title>
+    <link rel="stylesheet" href="/static/inventory.css">
+    <script src="/static/inventory.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Destiny Web App home">
+        <span class="brand-mark">D</span>
+        <span>Destiny Web App</span>
+      </a>
+      <nav>
+        <a class="active" href="/inventory">Inventory</a>
+        <a href="/cleaner/weapons">Weapon cleaner</a>
+        <a href="/data/status">Data status</a>
+      </nav>
+      <div class="account">
+        <span class="account-dot"></span>
+        <span>$guardian_name</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Guardian inventory</p>
+          <h1>Everything you carry.<br><em>Nothing hidden.</em></h1>
+        </div>
+        <div class="hero-stats">
+          <div><strong>$item_total</strong><span>Items</span></div>
+          <div><strong>$vault_total</strong><span>In vault</span></div>
+          <div>
+            <strong class="status-$sync_tone">$sync_label</strong>
+            <span>$snapshot_age</span>
+          </div>
+        </div>
+      </section>
+
+      $notice
+
+      <section class="toolbar" aria-label="Inventory filters">
+        <label class="search">
+          <span aria-hidden="true">⌕</span>
+          <input id="inventory-search" type="search"
+                 aria-label="Search inventory"
+                 placeholder="Search weapons, armor, and items…"
+                 autocomplete="off">
+          <kbd aria-hidden="true">/</kbd>
+        </label>
+        <div class="filter-row">
+          <label>
+            <span>Location</span>
+            <select id="location-filter">
+              <option value="">Everywhere</option>
+              <option value="equipped">Equipped</option>
+              <option value="character_inventory">Carried</option>
+              <option value="postmaster">Postmaster</option>
+              <option value="vault">Vault</option>
+              <option value="profile_inventory">Shared</option>
+            </select>
+          </label>
+          <label>
+            <span>Rarity</span>
+            <select id="rarity-filter">
+              <option value="">All rarities</option>
+            </select>
+          </label>
+          <label>
+            <span>Owner</span>
+            <select id="owner-filter">
+              <option value="">All owners</option>
+            </select>
+          </label>
+          <label>
+            <span>Bucket</span>
+            <select id="bucket-filter">
+              <option value="">All buckets</option>
+            </select>
+          </label>
+          <label>
+            <span>Item type</span>
+            <select id="type-filter">
+              <option value="">All item types</option>
+            </select>
+          </label>
+          <label class="check-filter">
+            <input id="locked-filter" type="checkbox">
+            <span>Locked only</span>
+          </label>
+          <button id="clear-filters" class="quiet-button" type="button">Clear</button>
+          <form class="manifest-update" method="post"
+                action="/inventory/manifest/sync">
+            $manifest_csrf
+            <button class="quiet-button" type="submit">Check definitions</button>
+          </form>
+        </div>
+        <p id="filter-result" class="filter-result" aria-live="polite"></p>
+      </section>
+
+      $body
+    </main>
+
+    <dialog id="item-dialog" class="item-dialog" aria-label="Item details">
+      <button class="dialog-close" type="button" aria-label="Close details">×</button>
+      <div id="item-detail" class="item-detail">
+        <div class="drawer-loading">Loading item details…</div>
+      </div>
+    </dialog>
+
+    <div id="manifest-wait" class="wait-screen" role="status"
+         aria-live="polite" hidden>
+      <div class="wait-spinner"></div>
+      <strong>Preparing the Destiny item catalog</strong>
+      <p>The first download can take a minute. Keep this page open.</p>
+    </div>
+  </body>
+</html>

@@ -1,4 +1,23 @@
-from webApp import auth, Database
-import pdb
+"""Stable entry point for the Destiny Web App."""
 
-auth.start()
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from destiny_web_app.web import run  # noqa: E402
+
+
+def main() -> None:
+    """Launch the Destiny Web App HTTPS server."""
+    run()
+
+
+if __name__ == "__main__":
+    main()
