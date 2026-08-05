@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090d12">
+    <title>$loadout_name · Saved Loadouts · Destiny Web App</title>
+    <link rel="stylesheet" href="/static/loadouts.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Destiny Web App home">
+        <span class="brand-mark">D</span><span>Destiny Web App</span>
+      </a>
+      <nav>
+        <a href="/inventory">Inventory</a>
+        <a class="active" href="/loadouts">Loadouts</a>
+        <a href="/cleaner/weapons">Weapons</a>
+        <a href="/cleaner/armor">Armor</a>
+        <a href="/data/status">Data status</a>
+      </nav>
+      <div class="account"><span class="account-dot"></span>$guardian_name</div>
+    </header>
+    <main>
+      <nav class="breadcrumb" aria-label="Breadcrumb">
+        <a href="/loadouts">Loadouts</a><span aria-hidden="true">/</span>
+        <span>Saved library</span>
+      </nav>
+      $notices
+      <section class="saved-hero">
+        <div>
+          <p class="eyebrow">$class_name · Application-owned loadout</p>
+          <h1>$loadout_name</h1>
+          $description
+          <div class="tags">$tags</div>
+        </div>
+        $provenance
+      </section>
+      $status
+      $loadout_controls
+      $comparison
+      $revision_history
+      <section class="detail-intro">
+        <div><p class="eyebrow">Immutable revision</p><h2>Exact items and ordered sockets</h2></div>
+        <p>Validation never substitutes a similar item. A missing, incompatible,
+        or moved exact instance invalidates this saved loadout.</p>
+      </section>
+      <section class="loadout-item-list">$item_list</section>
+      $local_controls
+    </main>
+  </body>
+</html>

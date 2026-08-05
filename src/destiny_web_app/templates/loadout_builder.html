@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090d12">
+    <title>Loadout Builder · Destiny Web App</title>
+    <link rel="stylesheet" href="/static/loadouts.css">
+    <script defer src="/static/loadout_builder.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/"><span class="brand-mark">D</span><span>Destiny Web App</span></a>
+      <nav><a href="/inventory">Inventory</a><a class="active" href="/loadouts">Loadouts</a><a href="/cleaner/weapons">Weapons</a><a href="/cleaner/armor">Armor</a><a href="/data/status">Data status</a></nav>
+      <div class="account"><span class="account-dot"></span>$guardian_name</div>
+    </header>
+    <main>
+      <nav class="breadcrumb"><a href="/loadouts">Loadouts</a><span>/</span><span>Builder</span></nav>
+      $notices
+      <section class="hero builder-hero"><div><p class="eyebrow">Goal 4 · exact instances</p><h1>Build a <em>loadout.</em></h1><p>Choose one exact item for every gameplay slot. Current plugs are captured as evidence; unsupported plug changes are never implied.</p></div></section>
+      <nav class="builder-classes" aria-label="Character class">$class_tabs</nav>
+      $builder
+    </main>
+  </body>
+</html>
