@@ -28,6 +28,27 @@ class BungieTemporarilyUnavailable(BungieError):
     """Bungie or the network could not service the request."""
 
 
+class BungieActionError(BungieError):
+    """A Destiny write failed with structured durable evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        error_code: int | None = None,
+        error_status: str = "",
+        throttle_seconds: float = 0,
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = error_code
+        self.error_status = error_status
+        self.throttle_seconds = throttle_seconds
+        self.transient = transient
+
+
 class BungieClient:
     AUTHORIZATION_URL = "https://www.bungie.net/en/OAuth/Authorize"
     TOKEN_URL = "https://www.bungie.net/Platform/App/OAuth/token/"
@@ -41,6 +62,27 @@ class BungieClient:
     MANIFEST_URL = "https://www.bungie.net/Platform/Destiny2/Manifest/"
     SET_LOCK_STATE_URL = (
         "https://www.bungie.net/Platform/Destiny2/Actions/Items/SetLockState/"
+    )
+    TRANSFER_ITEM_URL = (
+        "https://www.bungie.net/Platform/Destiny2/Actions/Items/TransferItem/"
+    )
+    EQUIP_ITEMS_URL = (
+        "https://www.bungie.net/Platform/Destiny2/Actions/Items/EquipItems/"
+    )
+    INSERT_SOCKET_PLUG_FREE_URL = (
+        "https://www.bungie.net/Platform/Destiny2/Actions/Items/"
+        "InsertSocketPlugFree/"
+    )
+    SNAPSHOT_LOADOUT_URL = (
+        "https://www.bungie.net/Platform/Destiny2/Actions/Loadouts/"
+        "SnapshotLoadout/"
+    )
+    UPDATE_LOADOUT_IDENTIFIERS_URL = (
+        "https://www.bungie.net/Platform/Destiny2/Actions/Loadouts/"
+        "UpdateLoadoutIdentifiers/"
+    )
+    CLEAR_LOADOUT_URL = (
+        "https://www.bungie.net/Platform/Destiny2/Actions/Loadouts/ClearLoadout/"
     )
     BUNGIE_ROOT = "https://www.bungie.net"
 
@@ -239,6 +281,250 @@ class BungieClient:
             raise BungieError(message or "Bungie rejected an item lock action.")
         throttle = payload.get("ThrottleSeconds")
         return throttle if isinstance(throttle, int) and throttle > 0 else 0
+
+    async def transfer_item(
+        self,
+        access_token: str,
+        *,
+        item_instance_id: str,
+        item_hash: int,
+        character_id: str,
+        membership_type: int,
+        transfer_to_vault: bool,
+    ) -> dict[str, Any]:
+        """Transfer one exact item between a character and the vault."""
+
+        return await self._post_destiny_action(
+            self.TRANSFER_ITEM_URL,
+            access_token,
+            {
+                "itemReferenceHash": item_hash,
+                "stackSize": 1,
+                "transferToVault": transfer_to_vault,
+                "itemId": item_instance_id,
+                "characterId": character_id,
+                "membershipType": membership_type,
+            },
+            label="transferring an item",
+        )
+
+    async def equip_items(
+        self,
+        access_token: str,
+        *,
+        item_instance_ids: list[str],
+        character_id: str,
+        membership_type: int,
+    ) -> dict[str, Any]:
+        """Equip exact items and validate every returned per-item status."""
+
+        result = await self._post_destiny_action(
+            self.EQUIP_ITEMS_URL,
+            access_token,
+            {
+                "itemIds": item_instance_ids,
+                "characterId": character_id,
+                "membershipType": membership_type,
+            },
+            label="equipping loadout items",
+        )
+        response = result.get("response")
+        rows = response.get("equipResults") if isinstance(response, dict) else None
+        if not isinstance(rows, list):
+            raise BungieActionError(
+                "Bungie returned no per-item equip results.",
+                http_status=result.get("http_status"),
+                error_code=result.get("error_code"),
+                error_status="MissingEquipResults",
+            )
+        statuses = {
+            str(row.get("itemInstanceId")): row.get("equipStatus")
+            for row in rows
+            if isinstance(row, dict)
+        }
+        failed = [
+            (item_id, statuses.get(item_id))
+            for item_id in item_instance_ids
+            if statuses.get(item_id) != 1
+        ]
+        if failed:
+            detail = ", ".join(
+                f"{item_id} (equipStatus {status})"
+                for item_id, status in failed
+            )
+            raise BungieActionError(
+                f"Bungie did not equip: {detail}.",
+                http_status=result.get("http_status"),
+                error_code=(failed[0][1] if isinstance(failed[0][1], int) else None),
+                error_status="EquipItemFailed",
+            )
+        result["message"] = (
+            f"Bungie reported successful equip status for "
+            f"{len(item_instance_ids)} item(s)."
+        )
+        result["equip_results"] = rows
+        return result
+
+    async def insert_socket_plug_free(
+        self,
+        access_token: str,
+        *,
+        item_instance_id: str,
+        socket_index: int,
+        plug_hash: int,
+        character_id: str,
+        membership_type: int,
+    ) -> dict[str, Any]:
+        """Insert one server-reported free socket plug."""
+
+        return await self._post_destiny_action(
+            self.INSERT_SOCKET_PLUG_FREE_URL,
+            access_token,
+            {
+                "itemId": item_instance_id,
+                "plug": {
+                    "socketIndex": socket_index,
+                    "socketArrayType": 0,
+                    "plugItemHash": plug_hash,
+                },
+                "characterId": character_id,
+                "membershipType": membership_type,
+            },
+            label="inserting a free loadout plug",
+        )
+
+    async def snapshot_loadout(
+        self,
+        access_token: str,
+        *,
+        loadout_index: int,
+        character_id: str,
+        membership_type: int,
+    ) -> dict[str, Any]:
+        """Snapshot currently equipped state into one zero-based game slot."""
+
+        return await self._post_destiny_action(
+            self.SNAPSHOT_LOADOUT_URL,
+            access_token,
+            {
+                # Bungie's endpoint rejects the request if these nullable
+                # members of DestinyLoadoutUpdateActionRequest are omitted.
+                "colorHash": None,
+                "iconHash": None,
+                "nameHash": None,
+                "loadoutIndex": loadout_index,
+                "characterId": character_id,
+                "membershipType": membership_type,
+            },
+            label="snapshotting an in-game loadout",
+        )
+
+    async def update_loadout_identifiers(
+        self,
+        access_token: str,
+        *,
+        loadout_index: int,
+        character_id: str,
+        membership_type: int,
+        name_hash: int | None,
+        icon_hash: int | None,
+        color_hash: int | None,
+    ) -> dict[str, Any]:
+        """Update the constrained Bungie name, icon, and color identifiers."""
+
+        return await self._post_destiny_action(
+            self.UPDATE_LOADOUT_IDENTIFIERS_URL,
+            access_token,
+            {
+                "colorHash": color_hash,
+                "iconHash": icon_hash,
+                "nameHash": name_hash,
+                "loadoutIndex": loadout_index,
+                "characterId": character_id,
+                "membershipType": membership_type,
+            },
+            label="updating loadout identifiers",
+        )
+
+    async def clear_loadout(
+        self,
+        access_token: str,
+        *,
+        loadout_index: int,
+        character_id: str,
+        membership_type: int,
+    ) -> dict[str, Any]:
+        """Clear one zero-based Bungie loadout slot."""
+
+        return await self._post_destiny_action(
+            self.CLEAR_LOADOUT_URL,
+            access_token,
+            {
+                "loadoutIndex": loadout_index,
+                "characterId": character_id,
+                "membershipType": membership_type,
+            },
+            label="clearing an in-game loadout",
+        )
+
+    async def _post_destiny_action(
+        self,
+        url: str,
+        access_token: str,
+        body: dict[str, Any],
+        *,
+        label: str,
+    ) -> dict[str, Any]:
+        """Send one action and retain HTTP/envelope/throttle evidence."""
+
+        session = await self._get_session()
+        try:
+            async with session.post(
+                url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-API-Key": self.settings.bungie_api_key,
+                },
+            ) as response:
+                payload = await read_json(response)
+                http_status = response.status
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise BungieActionError(
+                f"Could not reach Bungie while {label}.", transient=True
+            ) from error
+        error_code = payload.get("ErrorCode")
+        error_status = str(payload.get("ErrorStatus") or "")
+        message = str(payload.get("Message") or "")
+        raw_throttle = payload.get("ThrottleSeconds")
+        throttle = (
+            float(raw_throttle)
+            if isinstance(raw_throttle, (int, float))
+            and not isinstance(raw_throttle, bool)
+            and raw_throttle > 0
+            else 0.0
+        )
+        if http_status == 401:
+            raise BungieAuthenticationRejected(
+                f"Bungie rejected the access token while {label}."
+            )
+        if http_status >= 400 or error_code != 1:
+            raise BungieActionError(
+                message or error_status or f"Bungie rejected {label}.",
+                http_status=http_status,
+                error_code=error_code if isinstance(error_code, int) else None,
+                error_status=error_status,
+                throttle_seconds=throttle,
+                transient=(http_status == 429 or throttle > 0),
+            )
+        return {
+            "http_status": http_status,
+            "error_code": error_code,
+            "error_status": error_status,
+            "message": message,
+            "throttle_seconds": throttle,
+            "response": payload.get("Response"),
+        }
 
     async def get_manifest_metadata(self) -> dict[str, Any]:
         session = await self._get_session()

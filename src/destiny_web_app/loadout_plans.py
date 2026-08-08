@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from destiny_web_app.database import Database
 from destiny_web_app.loadout_manager import (
     CLASS_NAMES,
     LoadoutInspectionError,
     LoadoutManagerService,
 )
+
+if TYPE_CHECKING:
+    from destiny_web_app.loadouts.storage import LoadoutStore
 
 
 class ActivityPlanError(ValueError):
@@ -20,7 +22,7 @@ class ActivityPlanError(ValueError):
 class ActivityPlanService:
     def __init__(
         self,
-        database: Database,
+        database: LoadoutStore,
         loadouts: LoadoutManagerService,
     ) -> None:
         self.database = database

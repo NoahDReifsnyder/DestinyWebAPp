@@ -8,7 +8,7 @@ import json
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from destiny_web_app.bungie import (
     BungieActionError,
@@ -16,7 +16,7 @@ from destiny_web_app.bungie import (
     BungieClient,
     BungieError,
 )
-from destiny_web_app.database import Database, as_iso, utc_now
+from destiny_web_app.database import as_iso, utc_now
 from destiny_web_app.inventory import InventoryService
 from destiny_web_app.loadout_manager import (
     CLASS_NAMES,
@@ -35,6 +35,9 @@ from destiny_web_app.loadout_manager import (
 )
 from destiny_web_app.loadout_plans import ActivityPlanService
 from destiny_web_app.manifest import ManifestService
+
+if TYPE_CHECKING:
+    from destiny_web_app.loadouts.storage import LoadoutStore
 
 
 PREVIEW_LIFETIME = timedelta(minutes=5)
@@ -69,7 +72,7 @@ class LoadoutOperationError(RuntimeError):
 class LoadoutSyncService:
     def __init__(
         self,
-        database: Database,
+        database: LoadoutStore,
         bungie: BungieClient,
         inventory: InventoryService,
         manifest: ManifestService,

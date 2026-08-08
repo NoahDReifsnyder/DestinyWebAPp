@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 7
+# Loadout-specific migrations 8–12 are initialized by LoadoutStore. Keeping
+# the aggregate version here lets the generic database safely open an existing
+# loadout-enabled database before that subsystem is constructed.
+SCHEMA_VERSION = 12
 INVENTORY_HISTORY_LIMIT = 3
 CLEANER_HISTORY_LIMIT = 10
 

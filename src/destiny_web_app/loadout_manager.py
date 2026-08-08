@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
-from destiny_web_app.database import Database
 from destiny_web_app.manifest import ManifestError, ManifestService
+
+if TYPE_CHECKING:
+    from destiny_web_app.loadouts.storage import LoadoutStore
 
 
 CLASS_NAMES = {0: "Titan", 1: "Hunter", 2: "Warlock", 3: "Guardian"}
@@ -133,7 +135,7 @@ class LoadoutManagerService:
 
     def __init__(
         self,
-        database: Database,
+        database: LoadoutStore,
         manifest: ManifestService,
     ) -> None:
         self.database = database
@@ -1138,8 +1140,11 @@ class LoadoutManagerService:
         *,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
+        source = self.database.load_active_loadout_source(
+            bungie_membership_id
+        )
         return [
-            self._enrich_saved(loadout)
+            self._enrich_saved(loadout, source=source)
             for loadout in self.database.list_saved_loadouts(
                 bungie_membership_id,
                 include_archived=include_archived,
@@ -1167,8 +1172,11 @@ class LoadoutManagerService:
         bungie_membership_id: str,
         loadout_id: str,
     ) -> list[dict[str, Any]]:
+        source = self.database.load_active_loadout_source(
+            bungie_membership_id
+        )
         return [
-            self._enrich_saved(revision)
+            self._enrich_saved(revision, source=source)
             for revision in self.database.list_loadout_revisions(
                 bungie_membership_id,
                 loadout_id,
@@ -1376,7 +1384,22 @@ class LoadoutManagerService:
             )
         return source, character, manifest_version
 
-    def _enrich_saved(self, loadout: dict[str, Any]) -> dict[str, Any]:
+    def _enrich_saved(
+        self,
+        loadout: dict[str, Any],
+        *,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if source is None:
+            source = self.database.load_active_loadout_source(
+                str(loadout["bungie_membership_id"])
+            )
+        live_items = {
+            str(item["item_instance_id"]): item
+            for item in (source["items"] if source is not None else [])
+            if item.get("item_instance_id")
+        }
+        validation_issues: list[str] = []
         item_hashes = {int(item["item_hash"]) for item in loadout["items"]}
         plug_hashes = {
             int(plug["plug_hash"])
@@ -1413,6 +1436,30 @@ class LoadoutManagerService:
                 )
                 or f"Bucket {item['bucket_hash']}"
             )
+            live = live_items.get(str(item["item_instance_id"]))
+            item_issues: list[str] = []
+            if source is None:
+                item_issues.append("Live inventory is unavailable.")
+            elif live is None:
+                item_issues.append(
+                    f"Instance {item['item_instance_id']} is no longer owned."
+                )
+            else:
+                if int(live["item_hash"]) != int(item["item_hash"]):
+                    item_issues.append(
+                        f"Instance {item['item_instance_id']} now has a different item hash."
+                    )
+                if (
+                    live.get("source_kind") != item["captured_source_kind"]
+                    or live.get("character_id")
+                    != item.get("captured_character_id")
+                ):
+                    item_issues.append(
+                        f"Instance {item['item_instance_id']} moved from its captured location."
+                    )
+            item["validation_issues"] = item_issues
+            item["live_status"] = "invalid" if item_issues else "valid"
+            validation_issues.extend(item_issues)
             for plug in item["plugs"]:
                 plug_definition = (
                     plug_definitions.get(int(plug["plug_hash"]))
@@ -1437,6 +1484,10 @@ class LoadoutManagerService:
         )
         loadout["reference_item_count"] = len(
             loadout["canonical_payload"].get("reference_items", [])
+        )
+        loadout["validation_issues"] = validation_issues
+        loadout["live_status"] = (
+            "invalid" if validation_issues else "valid"
         )
         return loadout
 

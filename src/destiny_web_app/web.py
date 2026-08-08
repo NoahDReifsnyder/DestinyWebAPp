@@ -20,6 +20,10 @@ from destiny_web_app.app_keys import (
     BUNGIE_CLIENT_KEY,
     DATABASE_KEY,
     INVENTORY_SERVICE_KEY,
+    LOADOUT_FUNCTIONS_KEY,
+    LOADOUT_MANAGER_SERVICE_KEY,
+    ACTIVITY_PLAN_SERVICE_KEY,
+    LOADOUT_SYNC_SERVICE_KEY,
     MANIFEST_SERVICE_KEY,
     SETTINGS_KEY,
     TOKEN_REFRESH_LOCKS_KEY,
@@ -68,6 +72,50 @@ from destiny_web_app.inventory_routes import (
 )
 from destiny_web_app.manifest import ManifestService
 from destiny_web_app.organizer import ArmorOrganizerService, WeaponOrganizerService
+from destiny_web_app.loadouts.runtime import build_loadout_functions
+from destiny_web_app.loadout_builder_routes import (
+    loadout_builder_items,
+    loadout_builder_page,
+    save_builder_loadout,
+)
+from destiny_web_app.loadout_routes import (
+    archive_saved_loadout,
+    capture_current_loadout,
+    clone_saved_loadout,
+    delete_saved_loadout,
+    export_saved_loadout,
+    favorite_saved_loadout,
+    import_in_game_loadout,
+    import_saved_loadout_bundle,
+    loadout_manager_page,
+    loadout_slot_page,
+    restore_saved_loadout_revision,
+    revise_saved_loadout,
+    saved_loadout_page,
+    update_saved_loadout,
+)
+from destiny_web_app.loadout_plan_routes import (
+    activity_plan_page,
+    add_plan_assignment,
+    add_plan_encounter,
+    archive_activity_plan,
+    create_activity_plan,
+    delete_activity_plan,
+    export_activity_plan,
+    remove_plan_assignment,
+    remove_plan_encounter,
+    update_activity_plan,
+    update_plan_encounter,
+)
+from destiny_web_app.loadout_sync_routes import (
+    confirm_loadout_preview,
+    create_activity_plan_preview,
+    create_single_loadout_preview,
+    loadout_operation_page,
+    loadout_operation_status,
+    loadout_preview_page,
+    resume_loadout_operation,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -128,6 +176,16 @@ def create_app(settings: Settings | None = None) -> web.Application:
         manifest_service,
         app[ARMOR_CLEANER_SERVICE_KEY],
     )
+    loadout_functions = build_loadout_functions(
+        database,
+        bungie,
+        app[INVENTORY_SERVICE_KEY],
+        manifest_service,
+    )
+    app[LOADOUT_FUNCTIONS_KEY] = loadout_functions
+    app[LOADOUT_MANAGER_SERVICE_KEY] = loadout_functions.library
+    app[ACTIVITY_PLAN_SERVICE_KEY] = loadout_functions.sets
+    app[LOADOUT_SYNC_SERVICE_KEY] = loadout_functions.synchronization
     app.add_routes(
         [
             web.get("/", home),
@@ -163,6 +221,69 @@ def create_app(settings: Settings | None = None) -> web.Application:
             web.get(
                 "/cleaner/armor/organize/status",
                 armor_organization_status,
+            ),
+            web.get("/loadouts", loadout_manager_page),
+            web.get("/loadouts/builder", loadout_builder_page),
+            web.get("/loadouts/builder/items", loadout_builder_items),
+            web.post("/loadouts/builder/save", save_builder_loadout),
+            web.post("/loadouts/capture-current", capture_current_loadout),
+            web.post("/loadouts/import-slot", import_in_game_loadout),
+            web.post("/loadouts/import-bundle", import_saved_loadout_bundle),
+            web.get("/loadouts/saved/{loadout_id}", saved_loadout_page),
+            web.get(
+                "/loadouts/saved/{loadout_id}/export", export_saved_loadout
+            ),
+            web.post("/loadouts/saved/update", update_saved_loadout),
+            web.post("/loadouts/saved/revise", revise_saved_loadout),
+            web.post("/loadouts/saved/clone", clone_saved_loadout),
+            web.post(
+                "/loadouts/saved/restore-revision",
+                restore_saved_loadout_revision,
+            ),
+            web.post("/loadouts/saved/archive", archive_saved_loadout),
+            web.post("/loadouts/saved/favorite", favorite_saved_loadout),
+            web.post("/loadouts/saved/delete", delete_saved_loadout),
+            web.get(
+                "/loadouts/{character_id}/{slot_index}", loadout_slot_page
+            ),
+            web.post("/loadout-plans/create", create_activity_plan),
+            web.get("/loadout-plans/{plan_id}", activity_plan_page),
+            web.get(
+                "/loadout-plans/{plan_id}/export", export_activity_plan
+            ),
+            web.post("/loadout-plans/update", update_activity_plan),
+            web.post("/loadout-plans/encounters/add", add_plan_encounter),
+            web.post(
+                "/loadout-plans/encounters/update", update_plan_encounter
+            ),
+            web.post(
+                "/loadout-plans/encounters/remove", remove_plan_encounter
+            ),
+            web.post("/loadout-plans/assignments/add", add_plan_assignment),
+            web.post(
+                "/loadout-plans/assignments/remove", remove_plan_assignment
+            ),
+            web.post("/loadout-plans/archive", archive_activity_plan),
+            web.post("/loadout-plans/delete", delete_activity_plan),
+            web.post("/loadouts/preview", create_single_loadout_preview),
+            web.post(
+                "/loadout-plans/preview", create_activity_plan_preview
+            ),
+            web.get("/loadout-previews/{preview_id}", loadout_preview_page),
+            web.post(
+                "/loadout-previews/{preview_id}/confirm",
+                confirm_loadout_preview,
+            ),
+            web.get(
+                "/loadout-operations/{operation_id}", loadout_operation_page
+            ),
+            web.get(
+                "/loadout-operations/{operation_id}/status",
+                loadout_operation_status,
+            ),
+            web.post(
+                "/loadout-operations/{operation_id}/resume",
+                resume_loadout_operation,
             ),
         ]
     )

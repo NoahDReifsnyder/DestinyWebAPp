@@ -36,6 +36,7 @@ INVENTORY_COMPONENTS = (
     308,  # ItemPlugStates
     309,  # ItemPlugObjectives
     310,  # ItemReusablePlugs
+    1000,  # Transitory (live/offline activity evidence)
 )
 
 VAULT_LOCATION = 2

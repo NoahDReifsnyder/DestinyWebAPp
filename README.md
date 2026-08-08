@@ -315,6 +315,13 @@ locks retained armor, uses the owning character for carried or equipped items,
 and verifies every state with the same retry and second-refresh safeguards as
 the weapon organizer. It never dismantles, transfers, or equips armor.
 
+## Composable loadout functions
+
+The loadout subsystem is available independently of the server-rendered web
+flow. [LoadoutAPI.md](LoadoutAPI.md) maps the capability files, aligned public
+signatures, local/durable safety boundary, atomic Bungie actions, and example
+compositions for individual loadouts and activity sets.
+
 ## Current security boundary
 
 - Unsafe form submissions use session-bound CSRF tokens and same-origin checks.

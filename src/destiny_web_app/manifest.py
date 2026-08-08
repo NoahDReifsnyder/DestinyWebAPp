@@ -25,9 +25,17 @@ REQUIRED_TABLES = {
 }
 MAX_UNPACKED_MANIFEST_BYTES = 2 * 1024 * 1024 * 1024
 ALLOWED_TABLES = REQUIRED_TABLES | {
+    "DestinyActivityDefinition",
     "DestinyEquipableItemSetDefinition",
+    "DestinyLoadoutColorDefinition",
+    "DestinyLoadoutConstantsDefinition",
+    "DestinyLoadoutIconDefinition",
+    "DestinyLoadoutNameDefinition",
     "DestinyPlugSetDefinition",
     "DestinyItemCategoryDefinition",
+    "DestinyPlaceDefinition",
+    "DestinySocketCategoryDefinition",
+    "DestinySocketTypeDefinition",
 }
 
 
