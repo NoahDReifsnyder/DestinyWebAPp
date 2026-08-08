@@ -11,7 +11,7 @@ from typing import Any, Callable
 from destiny_web_app.database import Database, as_iso, compact_json, utc_now
 
 
-LOADOUT_SCHEMA_VERSION = 12
+LOADOUT_SCHEMA_VERSION = 13
 
 
 class LoadoutStore:
@@ -34,6 +34,25 @@ class LoadoutStore:
 
         with self.connection() as connection:
             connection.executescript(LOADOUT_SCHEMA)
+            # Version 12 created an all-column immutability trigger. Snapshot
+            # references are now intentionally rebased during inventory
+            # refresh, while the captured loadout content remains immutable.
+            connection.executescript(
+                """
+                DROP TRIGGER IF EXISTS loadout_revision_is_immutable;
+                CREATE TRIGGER loadout_revision_is_immutable
+                BEFORE UPDATE OF revision_id, loadout_id, revision_number,
+                    manifest_version, capture_source, source_character_id,
+                    source_slot_index, captured_at, capture_validation_status,
+                    capture_issues_json, canonical_payload_json,
+                    source_payload_json, parent_revision_id, revision_action,
+                    revision_note
+                ON loadout_revisions
+                BEGIN
+                    SELECT RAISE(ABORT, 'loadout revisions are immutable');
+                END;
+                """
+            )
             now = as_iso(utc_now())
             for version, name in (
                 (8, "application-owned exact loadouts"),
@@ -41,6 +60,7 @@ class LoadoutStore:
                 (10, "loadout previews and durable operations"),
                 (11, "loadout operation evidence"),
                 (12, "free socket synchronization actions"),
+                (13, "rebased ephemeral inventory snapshots"),
             ):
                 connection.execute(
                     """
@@ -1452,7 +1472,11 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS loadout_revision_is_immutable
-BEFORE UPDATE ON loadout_revisions
+BEFORE UPDATE OF revision_id, loadout_id, revision_number, manifest_version,
+    capture_source, source_character_id, source_slot_index, captured_at,
+    capture_validation_status, capture_issues_json, canonical_payload_json,
+    source_payload_json, parent_revision_id, revision_action, revision_note
+ON loadout_revisions
 BEGIN
     SELECT RAISE(ABORT, 'loadout revisions are immutable');
 END;

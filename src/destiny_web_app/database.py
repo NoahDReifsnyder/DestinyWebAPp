@@ -17,8 +17,10 @@ from typing import Any, Iterator, Sequence
 # Loadout-specific migrations 8–12 are initialized by LoadoutStore. Keeping
 # the aggregate version here lets the generic database safely open an existing
 # loadout-enabled database before that subsystem is constructed.
-SCHEMA_VERSION = 12
-INVENTORY_HISTORY_LIMIT = 3
+SCHEMA_VERSION = 13
+# Inventory is a live cache. Retain only the active snapshot; saved loadouts
+# are rebased to it during refresh and independently validated by item ID.
+INVENTORY_HISTORY_LIMIT = 1
 CLEANER_HISTORY_LIMIT = 10
 
 
@@ -1256,6 +1258,7 @@ class Database:
             self._prune_inventory_history(
                 connection,
                 snapshot.bungie_membership_id,
+                current_snapshot_id=snapshot_id,
                 keep=INVENTORY_HISTORY_LIMIT,
             )
         return snapshot_id
@@ -2047,22 +2050,72 @@ class Database:
         connection: sqlite3.Connection,
         bungie_membership_id: str,
         *,
+        current_snapshot_id: str,
         keep: int,
     ) -> None:
+        # Loadout captures are validated against the active inventory, not an
+        # archival snapshot. Repoint their provenance to the new active
+        # snapshot before pruning so saved loadouts never prevent inventory
+        # refresh. Their existing item-instance validation will mark them
+        # invalid when an item is no longer present.
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'loadout_revisions', 'loadout_previews',
+                      'cleaner_analysis_runs'
+                  )
+                """
+            ).fetchall()
+        }
+        if "loadout_revisions" in tables:
+            connection.execute(
+                """
+                UPDATE loadout_revisions
+                SET snapshot_id = ?
+                WHERE snapshot_id IN (
+                    SELECT snapshot_id
+                    FROM inventory_snapshots
+                    WHERE bungie_membership_id = ?
+                )
+                """,
+                (current_snapshot_id, bungie_membership_id),
+            )
+        if "loadout_previews" in tables:
+            # A refresh changes the state fingerprint, so existing previews
+            # must not remain confirmable even though their FK is rebased.
+            connection.execute(
+                """
+                UPDATE loadout_previews
+                SET snapshot_id = ?, status = 'invalidated'
+                WHERE bungie_membership_id = ?
+                """,
+                (current_snapshot_id, bungie_membership_id),
+            )
+        # Cleaner results are derived from a snapshot and are not archival
+        # data. Remove results tied to older snapshots before deleting those
+        # snapshots; the cleaner services regenerate the current result.
+        if "cleaner_analysis_runs" in tables:
+            connection.execute(
+                """
+                DELETE FROM cleaner_analysis_runs
+                WHERE bungie_membership_id = ?
+                  AND snapshot_id != ?
+                """,
+                (bungie_membership_id, current_snapshot_id),
+            )
         old_rows = connection.execute(
             """
             SELECT snapshot_id
             FROM inventory_snapshots
             WHERE bungie_membership_id = ?
-              AND snapshot_id NOT IN (
-                  SELECT snapshot_id
-                  FROM cleaner_analysis_runs
-                  WHERE bungie_membership_id = ?
-              )
             ORDER BY fetched_at DESC
             LIMIT -1 OFFSET ?
             """,
-            (bungie_membership_id, bungie_membership_id, keep),
+            (bungie_membership_id, keep),
         ).fetchall()
         connection.executemany(
             "DELETE FROM inventory_snapshots WHERE snapshot_id = ?",
