@@ -20,6 +20,7 @@ from destiny_web_app.app_keys import (
     MANIFEST_SERVICE_KEY,
 )
 from destiny_web_app.armor_cleaner import (
+    ARMOR_ARCHETYPES,
     ARMOR_STAT_NAMES,
     DEFAULT_ACCEPTED_STATS,
     ArmorCleanerError,
@@ -243,7 +244,13 @@ def policy_from_form(form: Any, catalog: dict[int, dict[str, Any]]) -> dict[str,
     global_stats = selected_stats(form, "global_stats")
     global_interested = form.get("global_interested") == "1"
     global_include_raid = form.get("global_include_raid") == "1"
-    preferred_tuning = selected_tuning_stats(form, "global_preferred_tuning")
+    preferred_archetype = [
+        name
+        for name in form.getall("preferred_archetype", [])
+        if name in ARMOR_ARCHETYPES
+    ]
+    dump_stat_raw = form.get("dump_stat")
+    dump_stat = dump_stat_raw if dump_stat_raw in ARMOR_STAT_NAMES else None
     sets = {}
     for set_hash in catalog:
         catalog_entry = catalog[set_hash]
@@ -278,7 +285,8 @@ def policy_from_form(form: Any, catalog: dict[int, dict[str, Any]]) -> dict[str,
     return {
         "source_mode": str(form.get("source_mode") or "same"),
         "tuning_mode": str(form.get("tuning_mode") or "preferred"),
-        "preferred_tuning": preferred_tuning,
+        "preferred_archetype": preferred_archetype,
+        "dump_stat": dump_stat,
         "excluded_stats": [],
         "sets": sets,
     }
@@ -291,14 +299,6 @@ def selected_stats(form: Any, prefix: str) -> list[str]:
         if form.get(f"{prefix}_{field_name(name)}") == "1"
     ]
     return selected or list(DEFAULT_ACCEPTED_STATS)
-
-
-def selected_tuning_stats(form: Any, prefix: str) -> list[str]:
-    return [
-        name
-        for name in ARMOR_STAT_NAMES
-        if form.get(f"{prefix}_{field_name(name)}") == "1"
-    ]
 
 
 def infer_simple_defaults(
@@ -353,8 +353,13 @@ def infer_simple_defaults(
         "interested": uniform("interested", True),
         "include_raid": include_raid,
         "stats": stats,
-        "preferred_tuning": normalize_tuning_preferences(
-            policy.get("preferred_tuning")
+        "preferred_archetype": normalize_archetype_preferences(
+            policy.get("preferred_archetype")
+        ),
+        "dump_stat": (
+            policy.get("dump_stat")
+            if policy.get("dump_stat") in ARMOR_STAT_NAMES
+            else None
         ),
     }
 
@@ -395,24 +400,29 @@ def render_simple_stat_picker(prefix: str, selected: list[str]) -> str:
     return f'<div class="simple-stat-picker">{options}</div>'
 
 
-def normalize_tuning_preferences(value: Any) -> list[str]:
+def normalize_archetype_preferences(value: Any) -> list[str]:
     if isinstance(value, str):
-        return [value] if value in ARMOR_STAT_NAMES else []
+        return [value] if value in ARMOR_ARCHETYPES else []
     if not isinstance(value, list):
         return []
-    return [name for name in ARMOR_STAT_NAMES if name in value]
+    return [name for name in value if name in ARMOR_ARCHETYPES]
 
 
-def render_tuning_picker(prefix: str, selected: list[str]) -> str:
+def render_archetype_picker(selected: list[str] | None) -> str:
+    selected_set = set(selected or [])
     options = "".join(
-        checkbox(
-            f"{prefix}_{field_name(name)}",
-            name,
-            name in selected,
-        )
-        for name in ARMOR_STAT_NAMES
+        f'<label class="check"><input type="checkbox" name="preferred_archetype" '
+        f'value="{escape(name)}"{" checked" if name in selected_set else ""}>'
+        f"<span>{escape(name)} ({escape(label)})</span></label>"
+        for name, (label, _) in ARMOR_ARCHETYPES.items()
     )
     return f'<div class="simple-stat-picker">{options}</div>'
+
+
+def render_dump_stat_picker(selected: str | None) -> str:
+    options = [option("", "None", selected or "")]
+    options.extend(option(name, name, selected or "") for name in ARMOR_STAT_NAMES)
+    return "".join(options)
 
 
 def render_policy_form(request: web.Request, context: dict[str, Any]) -> str:
@@ -434,10 +444,10 @@ def render_policy_form(request: web.Request, context: dict[str, Any]) -> str:
                 "global_stats",
                 simple_defaults["stats"],
         )
-        tuning_preferences = render_tuning_picker(
-            "global_preferred_tuning",
-            simple_defaults["preferred_tuning"],
+        archetype_picker = render_archetype_picker(
+            simple_defaults.get("preferred_archetype"),
         )
+        dump_stat_picker = render_dump_stat_picker(simple_defaults.get("dump_stat"))
         return f"""
 <form class="armor-policy" method="post" action="/cleaner/armor/policy">
     {csrf_input(request, "/cleaner/armor/policy")}
@@ -453,12 +463,13 @@ def render_policy_form(request: web.Request, context: dict[str, Any]) -> str:
             {checkbox("global_interested", "Analyze and retain useful rolls", simple_defaults["interested"])}
             {checkbox("global_include_raid", "Include raid armor in analysis", simple_defaults["include_raid"])}
             <div class="simple-stats">
-                <strong>Preferred tuning slots (optional)</strong>
-                {tuning_preferences}
+                <strong>Preferred archetype (optional)</strong>
+                {archetype_picker}
             </div>
             <div class="simple-stats">
-                <strong>Stats to prioritize (applies to primary/secondary/tertiary)</strong>
-                {simple_stats}
+                <label>Dump stat (optional)
+                    <select name="dump_stat">{dump_stat_picker}</select>
+                </label>
             </div>
         </div>
     </section>
@@ -652,11 +663,7 @@ def render_armor_item(request: web.Request, item: dict[str, Any]) -> str:
     archetype_name = (
         archetype.get("name")
         if isinstance(archetype, dict) and archetype.get("name")
-        else "Unknown"
-    )
-    stats = "".join(
-        f'<span><strong>{row["value"]}</strong>{escape(row["name"])}</span>'
-        for row in item["stats"]
+        else "Legacy armor"
     )
     manual = item["reason"] == "Manual keep"
     keep_form = ""
@@ -693,7 +700,6 @@ def render_armor_item(request: web.Request, item: dict[str, Any]) -> str:
         <dt>Armor set</dt><dd>{escape(set_name)}</dd>
         <dt>Archetype</dt><dd>{escape(archetype_name)}</dd>
     </dl>
-    <div class="armor-stats">{stats}</div>
   <p>{escape(item["reason"])}</p>
   {comparison_link}
   {keep_form}

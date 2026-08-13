@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
@@ -23,6 +24,20 @@ ARMOR_STAT_NAMES = (
 DEFAULT_ACCEPTED_STATS = tuple(
     name for name in ARMOR_STAT_NAMES if name != "Health"
 )
+ARMOR_ARCHETYPES: dict[str, tuple[str, list[str]]] = {
+    "Siegebreaker":  ("Hlt · Grn", ["Health", "Grenade"]),
+    "Bulwark":       ("Hlt · Cls", ["Health", "Class"]),
+    "Brawler":       ("Mle · Hlt", ["Melee", "Health"]),
+    "Skirmisher":    ("Mle · Wpn", ["Melee", "Weapons"]),
+    "Grenadier":     ("Grn · Sup", ["Grenade", "Super"]),
+    "Demolitionist": ("Grn · Cls", ["Grenade", "Class"]),
+    "Colossus":      ("Sup · Hlt", ["Super", "Health"]),
+    "Paragon":       ("Sup · Mle", ["Super", "Melee"]),
+    "Reaver":        ("Cls · Mle", ["Class", "Melee"]),
+    "Specialist":    ("Cls · Wpn", ["Class", "Weapons"]),
+    "Gunner":        ("Wpn · Grn", ["Weapons", "Grenade"]),
+    "Powerhouse":    ("Wpn · Sup", ["Weapons", "Super"]),
+}
 CLASS_NAMES = {0: "Titan", 1: "Hunter", 2: "Warlock", 3: "Any class"}
 SLOT_TRAITS = {
     "item.armor.head": "Helmet",
@@ -207,19 +222,21 @@ def normalize_policy(
     tuning_mode = value.get("tuning_mode")
     if tuning_mode not in {"required", "preferred", "ignored"}:
         tuning_mode = "preferred"
-    preferred_tuning_raw = value.get("preferred_tuning")
-    if isinstance(preferred_tuning_raw, str):
-        preferred_tuning = (
-            [preferred_tuning_raw]
-            if preferred_tuning_raw in ARMOR_STAT_NAMES
+    preferred_archetype_raw = value.get("preferred_archetype")
+    if isinstance(preferred_archetype_raw, str):
+        preferred_archetype = (
+            [preferred_archetype_raw]
+            if preferred_archetype_raw in ARMOR_ARCHETYPES
             else []
         )
-    elif isinstance(preferred_tuning_raw, list):
-        preferred_tuning = [
-            name for name in ARMOR_STAT_NAMES if name in preferred_tuning_raw
+    elif isinstance(preferred_archetype_raw, list):
+        preferred_archetype = [
+            name for name in preferred_archetype_raw if name in ARMOR_ARCHETYPES
         ]
     else:
-        preferred_tuning = []
+        preferred_archetype = []
+    dump_stat_raw = value.get("dump_stat")
+    dump_stat = dump_stat_raw if dump_stat_raw in ARMOR_STAT_NAMES else None
     raw_sets = value.get("sets")
     if not isinstance(raw_sets, dict):
         raw_sets = {}
@@ -245,7 +262,8 @@ def normalize_policy(
     return {
         "source_mode": source_mode,
         "tuning_mode": tuning_mode,
-        "preferred_tuning": preferred_tuning,
+        "preferred_archetype": preferred_archetype,
+        "dump_stat": dump_stat,
         "excluded_stats": [],
         "sets": policies,
     }
@@ -335,15 +353,15 @@ def analyze_armor(
     manual_keeps: set[str],
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
-    preferred_tuning = policy.get("preferred_tuning")
-    if isinstance(preferred_tuning, str):
-        preferred_tuning_stats = {preferred_tuning}
-    elif isinstance(preferred_tuning, list):
-        preferred_tuning_stats = {
-            name for name in preferred_tuning if name in ARMOR_STAT_NAMES
-        }
-    else:
-        preferred_tuning_stats = set()
+    preferred_archetypes = policy.get("preferred_archetype") or []
+    if isinstance(preferred_archetypes, str):
+        preferred_archetypes = [preferred_archetypes]
+    preferred_tuning_stats = {
+        stat
+        for name in preferred_archetypes
+        if name in ARMOR_ARCHETYPES
+        for stat in ARMOR_ARCHETYPES[name][1]
+    }
     set_by_item = {
         item_hash: set_hash
         for set_hash, catalog in set_catalog.items()
@@ -417,15 +435,23 @@ def analyze_armor(
                 if item["tuned_stat"]
                 else False
             )
+        dump_stat = policy.get("dump_stat")
+        if dump_stat and dump_stat in item["intrinsic_stats"]:
+            decisions[item["item_row_id"]] = decision(
+                "candidate", f"Contains dump stat ({dump_stat})"
+            )
+            continue
         if mismatch:
             decisions[item["item_row_id"]] = decision(
                 "candidate", f"{mismatch.title()} stat is not selected"
             )
             continue
         if policy["tuning_mode"] == "required" and not item["tuning_aligned"]:
-            reason = "Tuning does not match the preferred slots"
-            if not preferred_tuning_stats:
-                reason = "Tuning is not aligned with selected stats"
+            reason = (
+                "Tuning does not match selected archetypes"
+                if preferred_archetypes
+                else "Tuning is not aligned with accepted stats"
+            )
             decisions[item["item_row_id"]] = decision(
                 "candidate", reason
             )
@@ -444,11 +470,18 @@ def analyze_armor(
             )
         ].append(item)
     for copies in duplicate_groups.values():
-        ordered = sorted(
+        ranked = sorted(
             copies,
             key=lambda item: duplicate_preference_key(item, policy),
             reverse=True,
         )
+        top_rank = duplicate_preference_key(ranked[0], policy)
+        top_ranked = [
+            item for item in ranked
+            if duplicate_preference_key(item, policy) == top_rank
+        ]
+        chosen = random.choice(top_ranked)
+        ordered = [chosen] + [item for item in ranked if item is not chosen]
         decisions[ordered[0]["item_row_id"]] = decision(
             "keep", "Representative of this intrinsic roll"
         )
@@ -520,15 +553,20 @@ def duplicate_preference_key(
     item: dict[str, Any],
     policy: dict[str, Any],
 ) -> tuple[int, int, int, int]:
-    """Rank copies of the same intrinsic roll for deterministic retention."""
+    """Rank copies of the same intrinsic roll by tuning priority."""
+    intrinsic_stats = item.get("intrinsic_stats") or []
+    tuned_stat = item.get("tuned_stat")
+    dump_stat = policy.get("dump_stat")
+
+    primary_stat = intrinsic_stats[0] if intrinsic_stats else None
+    secondary_stat = intrinsic_stats[1] if len(intrinsic_stats) > 1 else None
+    tertiary_stat = intrinsic_stats[2] if len(intrinsic_stats) > 2 else None
+
     return (
-        int(item["intrinsic_tuning_aligned"]),
-        int(
-            policy["tuning_mode"] == "preferred"
-            and item["tuning_aligned"]
-        ),
-        int(item["masterworked"]),
-        -item["item_row_id"],
+        int(tuned_stat == primary_stat),
+        int(tuned_stat == tertiary_stat),
+        int(tuned_stat == secondary_stat),
+        int(bool(tuned_stat) and tuned_stat != dump_stat),
     )
 
 
@@ -610,7 +648,7 @@ def extract_armor_item(
             display = plug.get("displayProperties", {})
             archetype = {
                 "hash": plug_hash,
-                "name": display.get("name") or "Unknown archetype",
+                "name": display.get("name") or "Legacy armor",
                 "description": display.get("description") or "",
             }
         elif category == "armor_stats":
