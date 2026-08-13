@@ -79,7 +79,6 @@ from destiny_web_app.loadout_builder_routes import (
     save_builder_loadout,
 )
 from destiny_web_app.loadout_routes import (
-    archive_saved_loadout,
     capture_current_loadout,
     clone_saved_loadout,
     delete_saved_loadout,
@@ -94,27 +93,23 @@ from destiny_web_app.loadout_routes import (
     saved_loadout_page,
     update_saved_loadout,
 )
-from destiny_web_app.loadout_plan_routes import (
-    activity_plan_page,
-    add_plan_assignment,
-    add_plan_encounter,
-    archive_activity_plan,
-    create_activity_plan,
-    delete_activity_plan,
-    export_activity_plan,
-    remove_plan_assignment,
-    remove_plan_encounter,
-    update_activity_plan,
-    update_plan_encounter,
-)
 from destiny_web_app.loadout_sync_routes import (
     confirm_loadout_preview,
-    create_activity_plan_preview,
+    create_loadout_set_preview,
     create_single_loadout_preview,
     loadout_operation_page,
     loadout_operation_status,
     loadout_preview_page,
     resume_loadout_operation,
+)
+from destiny_web_app.loadout_set_routes import (
+    create_loadout_page,
+    create_set,
+    create_set_from_character,
+    delete_set,
+    loadout_set_page,
+    rename_set,
+    save_set,
 )
 
 
@@ -184,7 +179,7 @@ def create_app(settings: Settings | None = None) -> web.Application:
     )
     app[LOADOUT_FUNCTIONS_KEY] = loadout_functions
     app[LOADOUT_MANAGER_SERVICE_KEY] = loadout_functions.library
-    app[ACTIVITY_PLAN_SERVICE_KEY] = loadout_functions.sets
+    app[ACTIVITY_PLAN_SERVICE_KEY] = loadout_functions.activity_plans
     app[LOADOUT_SYNC_SERVICE_KEY] = loadout_functions.synchronization
     app.add_routes(
         [
@@ -223,6 +218,7 @@ def create_app(settings: Settings | None = None) -> web.Application:
                 armor_organization_status,
             ),
             web.get("/loadouts", loadout_manager_page),
+            web.get("/loadouts/create", create_loadout_page),
             web.get("/loadouts/builder", loadout_builder_page),
             web.get("/loadouts/builder/items", loadout_builder_items),
             web.post("/loadouts/builder/save", save_builder_loadout),
@@ -240,35 +236,22 @@ def create_app(settings: Settings | None = None) -> web.Application:
                 "/loadouts/saved/restore-revision",
                 restore_saved_loadout_revision,
             ),
-            web.post("/loadouts/saved/archive", archive_saved_loadout),
             web.post("/loadouts/saved/favorite", favorite_saved_loadout),
             web.post("/loadouts/saved/delete", delete_saved_loadout),
             web.get(
                 "/loadouts/{character_id}/{slot_index}", loadout_slot_page
             ),
-            web.post("/loadout-plans/create", create_activity_plan),
-            web.get("/loadout-plans/{plan_id}", activity_plan_page),
-            web.get(
-                "/loadout-plans/{plan_id}/export", export_activity_plan
-            ),
-            web.post("/loadout-plans/update", update_activity_plan),
-            web.post("/loadout-plans/encounters/add", add_plan_encounter),
+            web.post("/loadout-sets/create", create_set),
             web.post(
-                "/loadout-plans/encounters/update", update_plan_encounter
+                "/loadout-sets/create-from-character",
+                create_set_from_character,
             ),
-            web.post(
-                "/loadout-plans/encounters/remove", remove_plan_encounter
-            ),
-            web.post("/loadout-plans/assignments/add", add_plan_assignment),
-            web.post(
-                "/loadout-plans/assignments/remove", remove_plan_assignment
-            ),
-            web.post("/loadout-plans/archive", archive_activity_plan),
-            web.post("/loadout-plans/delete", delete_activity_plan),
+            web.get("/loadout-sets/{set_id}", loadout_set_page),
+            web.post("/loadout-sets/save", save_set),
+            web.post("/loadout-sets/rename", rename_set),
+            web.post("/loadout-sets/delete", delete_set),
             web.post("/loadouts/preview", create_single_loadout_preview),
-            web.post(
-                "/loadout-plans/preview", create_activity_plan_preview
-            ),
+            web.post("/loadout-sets/preview", create_loadout_set_preview),
             web.get("/loadout-previews/{preview_id}", loadout_preview_page),
             web.post(
                 "/loadout-previews/{preview_id}/confirm",
@@ -324,7 +307,8 @@ async def home(request: web.Request) -> web.Response:
   <p>Your browser session and Bungie tokens are stored locally. Access tokens
   refresh automatically before they expire.</p>
   <p><a href="/auth/status">View non-secret session status</a></p>
-  <p><a class="button" href="/inventory">Open inventory</a></p>
+  <p><a class="button" href="/loadouts">Open loadout manager</a></p>
+  <p><a href="/inventory">Open inventory</a></p>
   <p><a href="/cleaner/weapons">Open weapon cleaner</a> ·
   <a href="/cleaner/armor">Open armor cleaner</a></p>
   <p><a href="/data/status">Inventory and database status</a></p>
@@ -487,7 +471,13 @@ class QuerySafeAccessLogger(AbstractAccessLogger):
         response: web.StreamResponse,
         time: float,
     ) -> None:
-        self.logger.info(
+        log = (
+            self.logger.debug
+            if request.rel_url.raw_path.endswith("/status")
+            and request.rel_url.raw_path.startswith("/loadout-operations/")
+            else self.logger.info
+        )
+        log(
             "%s %s -> %s in %.1f ms",
             request.method,
             request.rel_url.raw_path,

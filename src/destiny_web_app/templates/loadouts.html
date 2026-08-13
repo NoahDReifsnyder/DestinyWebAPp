@@ -1,79 +1,25 @@
 <!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#090d12">
-    <title>Loadouts · Destiny Web App</title>
-    <link rel="stylesheet" href="/static/loadouts.css">
-  </head>
-  <body>
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Destiny Web App home">
-        <span class="brand-mark">D</span>
-        <span>Destiny Web App</span>
-      </a>
-      <nav>
-        <a href="/inventory">Inventory</a>
-        <a class="active" href="/loadouts">Loadouts</a>
-        <a href="/cleaner/weapons">Weapons</a>
-        <a href="/cleaner/armor">Armor</a>
-        <a href="/data/status">Data status</a>
-      </nav>
-      <div class="account"><span class="account-dot"></span>$guardian_name</div>
-    </header>
-
-    <main>
-      <section class="hero">
-        <div>
-          <p class="eyebrow">LoadoutManager · Persistent library</p>
-          <h1>Your builds.<br><em>Captured exactly.</em></h1>
-          <p>Inspect Bungie's in-game slots or save a complete, application-owned
-          loadout from current equipment or the exact-item builder. Live
-          changes remain behind a fresh preview and explicit confirmation.</p>
-        </div>
-        <div class="snapshot-card">
-          <span class="status-dot $snapshot_tone"></span>
-          <div><strong>$snapshot_label</strong><small>Active inventory snapshot</small></div>
-          <a href="/data/status">Refresh data</a>
-        </div>
-      </section>
-
-      $warnings
-
-      <section class="summary" aria-label="Loadout inspection summary">
-        $summary
-      </section>
-
-      $capture_form
-
-      $library_filters
-
-      $saved_library
-
-      $import_card
-
-      $plan_creator
-
-      $activity_plans
-
-      $capability_matrix
-
-      <section class="verification-card">
-        <div>
-          <p class="eyebrow">Goal 2 manual verification gate</p>
-          <h2>Prove the saved state survives.</h2>
-        </div>
-        <ol>
-          <li>Capture current equipment and import one fully resolved in-game slot.</li>
-          <li>Restart the app and confirm both saved loadouts remain in the library.</li>
-          <li>Compare their exact instance IDs and ordered sockets with the source.</li>
-          <li>Move or remove one referenced item, synchronize, and confirm the saved
-              loadout becomes invalid instead of substituting another copy.</li>
-        </ol>
-      </section>
-
-      $body
-    </main>
-  </body>
-</html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#090d12"><title>Loadouts · Destiny Web App</title>
+<link rel="stylesheet" href="/static/loadouts.css"></head>
+<body><header class="topbar"><a class="brand" href="/"><span class="brand-mark">D</span><span>Destiny Web App</span></a>
+<nav><a href="/inventory">Inventory</a><a class="active" href="/loadouts">Loadouts</a><a href="/cleaner/weapons">Weapons</a><a href="/cleaner/armor">Armor</a></nav>
+<div class="account"><span class="account-dot"></span>$guardian_name</div></header>
+<main class="loadout-dashboard"><section class="dashboard-hero"><div><p class="eyebrow">Loadout manager</p>
+<h1>Your loadout sets.</h1><p>Build reusable 20-slot boards that mirror Destiny. Open a set to arrange it, or open any loadout for its exact gear and history.</p></div>
+<div class="dashboard-actions"><a class="primary-action" href="/loadouts/create">Create loadout</a>
+<details class="create-set-menu"><summary>Create set</summary><div class="create-set-panel"><form method="post" action="/loadout-sets/create">$create_set_csrf
+<label>Name<input name="name" maxlength="100" required placeholder="Raid loadouts"></label>
+<label>Class<select name="character_class" required><option value="0">Titan</option><option value="1">Hunter</option><option value="2">Warlock</option></select></label>
+<button type="submit">Create empty set</button></form><div class="create-set-divider"><span>or</span></div>
+<form method="post" action="/loadout-sets/create-from-character">$import_set_csrf
+<label>Name<input name="name" maxlength="100" required placeholder="Current Titan loadouts"></label>
+<label>Character<select name="character_id" required$import_set_disabled>$character_options</select></label>
+<small>Refreshes Destiny, saves every populated slot as a reusable loadout, and preserves its original position.</small>
+<button type="submit"$import_set_disabled>Import character slots</button></form></div></details></div></section>
+$warnings
+<section class="dashboard-counts"><span><strong>$set_count</strong> sets</span><span><strong>$loadout_count</strong> reusable loadouts</span></section>
+<section class="set-section-list" aria-label="Loadout sets">$set_sections</section>
+<details class="dashboard-section all-loadouts-section"><summary><span><strong>All loadouts</strong><small>Reusable library grouped by class</small></span><span class="section-chevron">⌄</span></summary>
+<div class="dashboard-section-body all-loadouts-body">$all_loadouts</div></details>
+</main></body></html>

@@ -12,10 +12,12 @@
       const response = await fetch(`/loadout-operations/${encodeURIComponent(id)}/status`, {headers: {'Accept': 'application/json'}, cache: 'no-store'});
       if (!response.ok) throw new Error('Progress request failed');
       const state = await response.json();
-      root.querySelector('[data-progress-phase]').textContent = state.phase;
+      const checkpoint = state.action_number ? `Checkpoint ${state.action_number}: ` : '';
+      root.querySelector('[data-progress-phase]').textContent = `${checkpoint}${state.phase}`;
       root.querySelector('[data-progress-count]').textContent = `${state.completed} / ${state.total}`;
       root.querySelector('[data-progress-bar]').style.width = `${state.progress_percent}%`;
-      root.querySelector('[data-progress-copy]').textContent = `${state.progress_percent}% complete · ${state.attempts} attempt(s) on the current checkpoint.`;
+      const retry = state.last_error ? ` · Retrying after: ${state.last_error}` : '';
+      root.querySelector('[data-progress-copy]').textContent = `${state.progress_percent}% complete · ${state.attempts} attempt(s) on the current checkpoint${retry}.`;
       root.querySelector('.progress-track').setAttribute('aria-valuenow', state.progress_percent);
       if (terminalStates.has(state.status) && !terminalStates.has(lastStatus)) {
         terminal = true;

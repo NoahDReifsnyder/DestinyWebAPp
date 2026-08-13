@@ -296,6 +296,11 @@ non-raid classification. Raid and non-raid coverage can be combined or kept
 separate. Tuning alignment can be required, preferred as a deterministic
 tie-breaker, or ignored.
 
+When otherwise-comparable copies have the same intrinsic stat spread, the
+cleaner first retains a copy whose tuning stat belongs to one of that piece's
+three intrinsic stat pools. The saved tuning preference, masterwork state, and
+stable instance ordering break any remaining ties.
+
 Exotics are always kept. Legendary armor that is not Tier 5 or has intrinsic
 Health is tagged for review. Incidental displayed Health points and tuning
 changes do not count as intrinsic Health. Locked, equipped, and
@@ -316,6 +321,19 @@ and verifies every state with the same retry and second-refresh safeguards as
 the weapon organizer. It never dismantles, transfers, or equips armor.
 
 ## Composable loadout functions
+
+The main `/loadouts` workspace is set-oriented. A named set belongs to one
+Guardian class and mirrors all 20 in-game loadout positions as a five-row,
+four-column board. Saved loadouts are reusable identities: one can appear more
+than once in a set and in any number of sets, while its immutable current
+revision supplies the exact items and captured sockets everywhere it is used.
+
+The dashboard keeps every set and the class-grouped all-loadouts library
+collapsed until opened. New loadouts import a populated, fully resolved Bungie
+slot and select an official Destiny cover icon. The dedicated set editor saves
+drag, swap, replace, move, and clear changes atomically. Applying a set uses the
+existing durable preview engine; empty board positions explicitly clear their
+matching Destiny slots and no automatic backup is created.
 
 The loadout subsystem is available independently of the server-rendered web
 flow. [LoadoutAPI.md](LoadoutAPI.md) maps the capability files, aligned public

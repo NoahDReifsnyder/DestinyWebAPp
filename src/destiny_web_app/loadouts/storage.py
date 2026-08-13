@@ -11,7 +11,7 @@ from typing import Any, Callable
 from destiny_web_app.database import Database, as_iso, compact_json, utc_now
 
 
-LOADOUT_SCHEMA_VERSION = 13
+LOADOUT_SCHEMA_VERSION = 14
 
 
 class LoadoutStore:
@@ -30,10 +30,43 @@ class LoadoutStore:
         return self.database.connection()
 
     def initialize(self) -> None:
-        """Create the final loadout schema idempotently and record versions 8–12."""
+        """Create the loadout schema and apply idempotent local upgrades."""
 
         with self.connection() as connection:
             connection.executescript(LOADOUT_SCHEMA)
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(loadouts)")
+            }
+            if "cover_icon_hash" not in columns:
+                connection.execute(
+                    "ALTER TABLE loadouts ADD COLUMN cover_icon_hash INTEGER"
+                )
+                connection.execute(
+                    """
+                    UPDATE loadouts
+                    SET cover_icon_hash = CAST(
+                        json_extract(
+                            (SELECT source_payload_json
+                             FROM loadout_revisions
+                             WHERE revision_id = loadouts.current_revision_id),
+                            '$.iconHash'
+                        ) AS INTEGER
+                    )
+                    WHERE json_extract(
+                        (SELECT source_payload_json
+                         FROM loadout_revisions
+                         WHERE revision_id = loadouts.current_revision_id),
+                        '$.iconHash'
+                    ) IS NOT NULL
+                    """
+                )
+            # Archive is no longer part of the set-oriented library flow.
+            # Make any legacy soft-hidden loadouts visible before the controls
+            # are retired so no saved content becomes unreachable.
+            connection.execute(
+                "UPDATE loadouts SET archived_at = NULL WHERE archived_at IS NOT NULL"
+            )
             # Version 12 created an all-column immutability trigger. Snapshot
             # references are now intentionally rebased during inventory
             # refresh, while the captured loadout content remains immutable.
@@ -51,6 +84,39 @@ class LoadoutStore:
                 BEGIN
                     SELECT RAISE(ABORT, 'loadout revisions are immutable');
                 END;
+
+                DROP TRIGGER IF EXISTS loadout_preview_source_owner_insert;
+                CREATE TRIGGER loadout_preview_source_owner_insert
+                BEFORE INSERT ON loadout_previews
+                WHEN (
+                    NEW.preview_type = 'single_slot' AND NOT EXISTS (
+                        SELECT 1 FROM loadout_revisions AS revision
+                        JOIN loadouts AS loadout
+                          ON loadout.loadout_id = revision.loadout_id
+                        WHERE revision.revision_id = NEW.source_revision_id
+                          AND loadout.loadout_id = NEW.source_entity_id
+                          AND loadout.bungie_membership_id = NEW.bungie_membership_id
+                    )
+                ) OR (
+                    NEW.preview_type = 'activity_plan'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM loadout_plan_revisions AS revision
+                        JOIN loadout_plans AS plan
+                          ON plan.plan_id = revision.plan_id
+                        WHERE revision.plan_revision_id = NEW.source_revision_id
+                          AND plan.plan_id = NEW.source_entity_id
+                          AND plan.bungie_membership_id = NEW.bungie_membership_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM loadout_sets AS board
+                        WHERE board.set_id = NEW.source_entity_id
+                          AND CAST(board.version AS TEXT) = NEW.source_revision_id
+                          AND board.bungie_membership_id = NEW.bungie_membership_id
+                    )
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'preview source has the wrong owner');
+                END;
                 """
             )
             now = as_iso(utc_now())
@@ -61,6 +127,7 @@ class LoadoutStore:
                 (11, "loadout operation evidence"),
                 (12, "free socket synchronization actions"),
                 (13, "rebased ephemeral inventory snapshots"),
+                (14, "current-state class loadout sets and cover icons"),
             ):
                 connection.execute(
                     """
@@ -151,6 +218,9 @@ class LoadoutStore:
         capture: dict[str, Any],
         revision_action: str = "capture",
         revision_note: str = "",
+        cover_icon_hash: int | None = None,
+        replace_in_set_id: str | None = None,
+        replace_loadout_id: str | None = None,
     ) -> dict[str, Any]:
         """Create one loadout and its immutable first revision atomically."""
 
@@ -163,13 +233,15 @@ class LoadoutStore:
                 """
                 INSERT INTO loadouts(
                     loadout_id, bungie_membership_id, name, description,
-                    tags_json, character_class_type, current_revision_id,
+                    tags_json, character_class_type, cover_icon_hash,
+                    current_revision_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     loadout_id, user_id, name, description, compact_json(tags),
-                    int(capture["character_class_type"]), now, now,
+                    int(capture["character_class_type"]), cover_icon_hash,
+                    now, now,
                 ),
             )
             self._insert_revision(
@@ -186,6 +258,39 @@ class LoadoutStore:
                 "UPDATE loadouts SET current_revision_id = ? WHERE loadout_id = ?",
                 (revision_id, loadout_id),
             )
+            if replace_in_set_id is not None:
+                board = connection.execute(
+                    """
+                    SELECT character_class_type FROM loadout_sets
+                    WHERE set_id = ? AND bungie_membership_id = ?
+                    """,
+                    (replace_in_set_id, user_id),
+                ).fetchone()
+                if board is None or int(board["character_class_type"]) != int(
+                    capture["character_class_type"]
+                ):
+                    raise ValueError(
+                        "The set is unavailable or has the wrong class."
+                    )
+                changed = connection.execute(
+                    """
+                    UPDATE loadout_set_slots SET loadout_id = ?
+                    WHERE set_id = ? AND loadout_id = ?
+                    """,
+                    (loadout_id, replace_in_set_id, replace_loadout_id),
+                ).rowcount
+                if not changed:
+                    raise ValueError(
+                        "The original loadout is no longer used by that set."
+                    )
+                connection.execute(
+                    """
+                    UPDATE loadout_sets
+                    SET version = version + 1, updated_at = ?
+                    WHERE set_id = ?
+                    """,
+                    (now, replace_in_set_id),
+                )
         saved = self.load_saved_loadout(user_id, loadout_id)
         if saved is None:
             raise RuntimeError("Saved loadout could not be reloaded.")
@@ -348,6 +453,7 @@ class LoadoutStore:
         name: str,
         description: str,
         tags: list[str],
+        cover_icon_hash: int | None = None,
     ) -> None:
         """Update mutable display metadata only."""
 
@@ -355,11 +461,13 @@ class LoadoutStore:
             changed = connection.execute(
                 """
                 UPDATE loadouts
-                SET name = ?, description = ?, tags_json = ?, updated_at = ?
+                SET name = ?, description = ?, tags_json = ?,
+                    cover_icon_hash = ?, updated_at = ?
                 WHERE bungie_membership_id = ? AND loadout_id = ?
                 """,
                 (
-                    name, description, compact_json(tags), as_iso(utc_now()),
+                    name, description, compact_json(tags), cover_icon_hash,
+                    as_iso(utc_now()),
                     user_id, loadout_id,
                 ),
             ).rowcount
@@ -386,6 +494,7 @@ class LoadoutStore:
             description=source["description"],
             tags=list(source["tags"]),
             capture=_capture_from_saved(source),
+            cover_icon_hash=source.get("cover_icon_hash"),
             revision_action="clone",
             revision_note=f"Cloned from {loadout_id}",
         )
@@ -458,15 +567,367 @@ class LoadoutStore:
             raise LookupError("The saved loadout is unavailable.")
 
     def delete_loadout(self, user_id: str, loadout_id: str) -> None:
-        """Delete a loadout unless an activity-set revision pins it."""
+        """Delete a loadout unless a current set or legacy plan pins it."""
 
         with self.connection() as connection:
+            current_set = connection.execute(
+                """
+                SELECT board.name
+                FROM loadout_set_slots AS slot
+                JOIN loadout_sets AS board ON board.set_id = slot.set_id
+                WHERE board.bungie_membership_id = ? AND slot.loadout_id = ?
+                LIMIT 1
+                """,
+                (user_id, loadout_id),
+            ).fetchone()
+            if current_set is not None:
+                raise ValueError(
+                    f"Remove this loadout from {current_set['name']} before deleting it."
+                )
             changed = connection.execute(
                 "DELETE FROM loadouts WHERE bungie_membership_id = ? AND loadout_id = ?",
                 (user_id, loadout_id),
             ).rowcount
         if not changed:
             raise LookupError("The saved loadout is unavailable.")
+
+    def create_loadout_set(
+        self,
+        user_id: str,
+        *,
+        name: str,
+        character_class_type: int,
+    ) -> dict[str, Any]:
+        """Create one empty, class-bound 20-position board."""
+
+        set_id = secrets.token_hex(16)
+        now = as_iso(utc_now())
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO loadout_sets(
+                    set_id, bungie_membership_id, name,
+                    character_class_type, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                """,
+                (set_id, user_id, name, character_class_type, now, now),
+            )
+        result = self.load_loadout_set(user_id, set_id)
+        if result is None:
+            raise RuntimeError("The loadout set could not be reloaded.")
+        return result
+
+    def create_loadout_set_from_captures(
+        self,
+        user_id: str,
+        *,
+        name: str,
+        character_class_type: int,
+        loadouts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically create a set and one new loadout per populated position."""
+
+        positions = [int(value["position"]) for value in loadouts]
+        if not loadouts:
+            raise ValueError("At least one populated loadout slot is required.")
+        if len(positions) != len(set(positions)) or any(
+            position < 0 or position >= 20 for position in positions
+        ):
+            raise ValueError(
+                "Imported loadout positions must be unique and between 0 and 19."
+            )
+        if any(
+            int(value["capture"]["character_class_type"])
+            != int(character_class_type)
+            for value in loadouts
+        ):
+            raise ValueError("Every imported loadout must match the set class.")
+
+        set_id = secrets.token_hex(16)
+        now = as_iso(utc_now())
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO loadout_sets(
+                    set_id, bungie_membership_id, name,
+                    character_class_type, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                """,
+                (set_id, user_id, name, character_class_type, now, now),
+            )
+            for value in loadouts:
+                loadout_id = secrets.token_hex(16)
+                revision_id = secrets.token_hex(16)
+                capture = value["capture"]
+                connection.execute(
+                    """
+                    INSERT INTO loadouts(
+                        loadout_id, bungie_membership_id, name, description,
+                        tags_json, character_class_type, cover_icon_hash,
+                        current_revision_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        loadout_id,
+                        user_id,
+                        value["name"],
+                        value.get("description", ""),
+                        compact_json(value.get("tags", [])),
+                        character_class_type,
+                        value.get("cover_icon_hash"),
+                        now,
+                        now,
+                    ),
+                )
+                self._insert_revision(
+                    connection,
+                    loadout_id=loadout_id,
+                    revision_id=revision_id,
+                    revision_number=1,
+                    capture=capture,
+                    parent_revision_id=None,
+                    revision_action="set_character_import",
+                    revision_note=(
+                        f"Imported from in-game slot {int(value['position']) + 1}"
+                    ),
+                )
+                connection.execute(
+                    "UPDATE loadouts SET current_revision_id = ? WHERE loadout_id = ?",
+                    (revision_id, loadout_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO loadout_set_slots(set_id, position, loadout_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (set_id, int(value["position"]), loadout_id),
+                )
+        result = self.load_loadout_set(user_id, set_id)
+        if result is None:
+            raise RuntimeError("The imported loadout set could not be reloaded.")
+        return result
+
+    def list_loadout_sets(self, user_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT set_id FROM loadout_sets
+                WHERE bungie_membership_id = ?
+                ORDER BY updated_at DESC, name COLLATE NOCASE
+                """,
+                (user_id,),
+            ).fetchall()
+        return [
+            value
+            for row in rows
+            if (value := self.load_loadout_set(user_id, row["set_id"]))
+            is not None
+        ]
+
+    def load_loadout_set(
+        self, user_id: str, set_id: str
+    ) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM loadout_sets
+                WHERE bungie_membership_id = ? AND set_id = ?
+                """,
+                (user_id, set_id),
+            ).fetchone()
+            if row is None:
+                return None
+            slots = connection.execute(
+                """
+                SELECT slot.position, slot.loadout_id, loadout.name,
+                       loadout.character_class_type, loadout.cover_icon_hash,
+                       loadout.current_revision_id, loadout.updated_at
+                FROM loadout_set_slots AS slot
+                JOIN loadouts AS loadout ON loadout.loadout_id = slot.loadout_id
+                WHERE slot.set_id = ?
+                ORDER BY slot.position
+                """,
+                (set_id,),
+            ).fetchall()
+        result = dict(row)
+        result["slots"] = [dict(slot) for slot in slots]
+        result["filled_count"] = len(slots)
+        return result
+
+    def rename_loadout_set(
+        self, user_id: str, set_id: str, *, name: str
+    ) -> dict[str, Any]:
+        with self.connection() as connection:
+            changed = connection.execute(
+                """
+                UPDATE loadout_sets
+                SET name = ?, version = version + 1, updated_at = ?
+                WHERE bungie_membership_id = ? AND set_id = ?
+                """,
+                (name, as_iso(utc_now()), user_id, set_id),
+            ).rowcount
+        if not changed:
+            raise LookupError("The loadout set is unavailable.")
+        result = self.load_loadout_set(user_id, set_id)
+        assert result is not None
+        return result
+
+    def save_loadout_set_slots(
+        self,
+        user_id: str,
+        set_id: str,
+        *,
+        slots: dict[int, str],
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Replace the complete board atomically with optimistic locking."""
+
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT character_class_type, version FROM loadout_sets
+                WHERE bungie_membership_id = ? AND set_id = ?
+                """,
+                (user_id, set_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError("The loadout set is unavailable.")
+            if int(row["version"]) != int(expected_version):
+                raise ValueError(
+                    "The loadout set changed while you were editing it. Reload and try again."
+                )
+            if any(position < 0 or position >= 20 for position in slots):
+                raise ValueError("Loadout set positions must be between 0 and 19.")
+            if slots:
+                placeholders = ",".join("?" for _ in slots)
+                found = connection.execute(
+                    f"""
+                    SELECT loadout_id, character_class_type FROM loadouts
+                    WHERE bungie_membership_id = ?
+                      AND loadout_id IN ({placeholders})
+                    """,
+                    (user_id, *slots.values()),
+                ).fetchall()
+                classes = {
+                    str(value["loadout_id"]): int(value["character_class_type"])
+                    for value in found
+                }
+                if set(classes) != set(slots.values()):
+                    raise ValueError("One or more selected loadouts are unavailable.")
+                if any(
+                    class_type != int(row["character_class_type"])
+                    for class_type in classes.values()
+                ):
+                    raise ValueError("Every loadout in a set must match its class.")
+            connection.execute(
+                "DELETE FROM loadout_set_slots WHERE set_id = ?", (set_id,)
+            )
+            connection.executemany(
+                """
+                INSERT INTO loadout_set_slots(set_id, position, loadout_id)
+                VALUES (?, ?, ?)
+                """,
+                ((set_id, position, loadout_id) for position, loadout_id in slots.items()),
+            )
+            connection.execute(
+                """
+                UPDATE loadout_sets
+                SET version = version + 1, updated_at = ?
+                WHERE set_id = ?
+                """,
+                (as_iso(utc_now()), set_id),
+            )
+        result = self.load_loadout_set(user_id, set_id)
+        assert result is not None
+        return result
+
+    def loadout_set_usages(
+        self, user_id: str, loadout_id: str
+    ) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT board.set_id, board.name, board.character_class_type,
+                       GROUP_CONCAT(slot.position) AS positions
+                FROM loadout_set_slots AS slot
+                JOIN loadout_sets AS board ON board.set_id = slot.set_id
+                WHERE board.bungie_membership_id = ? AND slot.loadout_id = ?
+                GROUP BY board.set_id, board.name, board.character_class_type
+                ORDER BY board.name COLLATE NOCASE
+                """,
+                (user_id, loadout_id),
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "positions": sorted(
+                    int(value) for value in str(row["positions"]).split(",")
+                ),
+            }
+            for row in rows
+        ]
+
+    def replace_loadout_in_set(
+        self,
+        user_id: str,
+        set_id: str,
+        *,
+        old_loadout_id: str,
+        new_loadout_id: str,
+    ) -> int:
+        """Replace every occurrence in one set and advance its version."""
+
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            board = connection.execute(
+                """
+                SELECT character_class_type FROM loadout_sets
+                WHERE bungie_membership_id = ? AND set_id = ?
+                """,
+                (user_id, set_id),
+            ).fetchone()
+            loadout = connection.execute(
+                """
+                SELECT character_class_type FROM loadouts
+                WHERE bungie_membership_id = ? AND loadout_id = ?
+                """,
+                (user_id, new_loadout_id),
+            ).fetchone()
+            if board is None or loadout is None:
+                raise LookupError("The set or replacement loadout is unavailable.")
+            if int(board["character_class_type"]) != int(loadout["character_class_type"]):
+                raise ValueError("The replacement loadout has the wrong class.")
+            changed = connection.execute(
+                """
+                UPDATE loadout_set_slots SET loadout_id = ?
+                WHERE set_id = ? AND loadout_id = ?
+                """,
+                (new_loadout_id, set_id, old_loadout_id),
+            ).rowcount
+            if not changed:
+                raise LookupError("That loadout is not used by this set.")
+            connection.execute(
+                """
+                UPDATE loadout_sets SET version = version + 1, updated_at = ?
+                WHERE set_id = ?
+                """,
+                (as_iso(utc_now()), set_id),
+            )
+        return int(changed)
+
+    def delete_loadout_set(self, user_id: str, set_id: str) -> None:
+        with self.connection() as connection:
+            changed = connection.execute(
+                """
+                DELETE FROM loadout_sets
+                WHERE bungie_membership_id = ? AND set_id = ?
+                """,
+                (user_id, set_id),
+            ).rowcount
+        if not changed:
+            raise LookupError("The loadout set is unavailable.")
 
     def application_loadout_instance_ids(self, user_id: str) -> set[str]:
         """Return exact instances protected by current loadouts and pinned sets."""
@@ -921,6 +1382,10 @@ class LoadoutStore:
             "character_class_type": int(capture["character_class_type"]),
             "items": items,
             "reference_items": list(capture.get("reference_items", [])),
+            "partial": bool(capture.get("partial")),
+            "unresolved_item_instance_ids": list(
+                capture.get("unresolved_item_instance_ids", [])
+            ),
         }
         connection.execute(
             """
@@ -1202,6 +1667,12 @@ def _capture_from_saved(value: dict[str, Any]) -> dict[str, Any]:
         "reference_items": list(
             value["canonical_payload"].get("reference_items", [])
         ),
+        "partial": bool(value["canonical_payload"].get("partial")),
+        "unresolved_item_instance_ids": list(
+            value["canonical_payload"].get(
+                "unresolved_item_instance_ids", []
+            )
+        ),
         "source_payload": dict(value["source_payload"]),
     }
 
@@ -1228,6 +1699,10 @@ CREATE TABLE IF NOT EXISTS loadouts (
     description TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 2000),
     tags_json TEXT NOT NULL DEFAULT '[]',
     character_class_type INTEGER NOT NULL CHECK (character_class_type BETWEEN 0 AND 3),
+    cover_icon_hash INTEGER CHECK (
+        cover_icon_hash IS NULL OR
+        (cover_icon_hash > 0 AND cover_icon_hash < 4294967296)
+    ),
     current_revision_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1238,6 +1713,61 @@ CREATE TABLE IF NOT EXISTS loadouts (
 );
 CREATE INDEX IF NOT EXISTS idx_loadouts_owner_time
     ON loadouts(bungie_membership_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS loadout_sets (
+    set_id TEXT PRIMARY KEY,
+    bungie_membership_id TEXT NOT NULL,
+    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 100),
+    character_class_type INTEGER NOT NULL CHECK (
+        character_class_type BETWEEN 0 AND 2
+    ),
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (bungie_membership_id)
+        REFERENCES users(bungie_membership_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_loadout_sets_owner_time
+    ON loadout_sets(bungie_membership_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS loadout_set_slots (
+    set_id TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 19),
+    loadout_id TEXT NOT NULL,
+    PRIMARY KEY (set_id, position),
+    FOREIGN KEY (set_id) REFERENCES loadout_sets(set_id) ON DELETE CASCADE,
+    FOREIGN KEY (loadout_id) REFERENCES loadouts(loadout_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_loadout_set_slots_loadout
+    ON loadout_set_slots(loadout_id);
+
+CREATE TRIGGER IF NOT EXISTS loadout_set_slot_owner_class_insert
+BEFORE INSERT ON loadout_set_slots
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM loadout_sets AS board
+        JOIN loadouts AS loadout
+          ON loadout.loadout_id = NEW.loadout_id
+         AND loadout.bungie_membership_id = board.bungie_membership_id
+         AND loadout.character_class_type = board.character_class_type
+        WHERE board.set_id = NEW.set_id
+    ) THEN RAISE(ABORT, 'loadout set slot owner or class mismatch') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS loadout_set_slot_owner_class_update
+BEFORE UPDATE OF set_id, loadout_id ON loadout_set_slots
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM loadout_sets AS board
+        JOIN loadouts AS loadout
+          ON loadout.loadout_id = NEW.loadout_id
+         AND loadout.bungie_membership_id = board.bungie_membership_id
+         AND loadout.character_class_type = board.character_class_type
+        WHERE board.set_id = NEW.set_id
+    ) THEN RAISE(ABORT, 'loadout set slot owner or class mismatch') END;
+END;
 
 CREATE TABLE IF NOT EXISTS loadout_revisions (
     revision_id TEXT PRIMARY KEY,
@@ -1553,6 +2083,11 @@ WHEN (
         WHERE revision.plan_revision_id = NEW.source_revision_id
           AND plan.plan_id = NEW.source_entity_id
           AND plan.bungie_membership_id = NEW.bungie_membership_id
+    ) AND NOT EXISTS (
+        SELECT 1 FROM loadout_sets AS board
+        WHERE board.set_id = NEW.source_entity_id
+          AND CAST(board.version AS TEXT) = NEW.source_revision_id
+          AND board.bungie_membership_id = NEW.bungie_membership_id
     )
 )
 BEGIN

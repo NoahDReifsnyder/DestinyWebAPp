@@ -9,6 +9,7 @@ from destiny_web_app.database import Database
 from destiny_web_app.inventory import InventoryService
 from destiny_web_app.loadout_manager import LoadoutManagerService
 from destiny_web_app.loadout_plans import ActivityPlanService
+from destiny_web_app.loadout_sets import LoadoutSetService
 from destiny_web_app.loadout_sync import LoadoutSyncService
 from destiny_web_app.manifest import ManifestService
 
@@ -27,7 +28,8 @@ class LoadoutFunctions:
     bungie: BungieClient
     inventory: InventoryService
     library: LoadoutManagerService
-    sets: ActivityPlanService
+    sets: LoadoutSetService
+    activity_plans: ActivityPlanService
     synchronization: LoadoutSyncService
 
 
@@ -42,14 +44,15 @@ def build_loadout_functions(
     store = LoadoutStore(database)
     store.initialize()
     library = LoadoutManagerService(store, manifest)
-    sets = ActivityPlanService(store, library)
+    activity_plans = ActivityPlanService(store, library)
+    sets = LoadoutSetService(store, library)
     synchronization = LoadoutSyncService(
         store,
         bungie,
         inventory,
         manifest,
         library,
-        sets,
+        activity_plans,
     )
     return LoadoutFunctions(
         store=store,
@@ -57,5 +60,6 @@ def build_loadout_functions(
         inventory=inventory,
         library=library,
         sets=sets,
+        activity_plans=activity_plans,
         synchronization=synchronization,
     )

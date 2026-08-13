@@ -15,6 +15,7 @@ def save_equipped_loadout(
     name: str,
     description: str = "",
     tags: Sequence[str] = (),
+    cover_icon_hash: int | None = None,
 ) -> dict[str, Any]:
     """Save one character's complete equipped gameplay state as a new loadout."""
 
@@ -24,6 +25,7 @@ def save_equipped_loadout(
         name=name,
         description=description,
         tags=list(tags),
+        cover_icon_hash=cover_icon_hash,
     )
 
 
@@ -36,6 +38,7 @@ def save_selected_loadout(
     name: str,
     description: str = "",
     tags: Sequence[str] = (),
+    cover_icon_hash: int | None = None,
 ) -> dict[str, Any]:
     """Save one complete loadout assembled from exact item instance IDs."""
 
@@ -46,6 +49,61 @@ def save_selected_loadout(
         name=name,
         description=description,
         tags=list(tags),
+        cover_icon_hash=cover_icon_hash,
+    )
+
+
+def revise_selected_loadout(
+    functions: LoadoutFunctions,
+    user_id: str,
+    *,
+    loadout_id: str,
+    character_class: int,
+    items_by_bucket: Mapping[int, str],
+    name: str,
+    description: str = "",
+    tags: Sequence[str] = (),
+    cover_icon_hash: int | None = None,
+) -> dict[str, Any]:
+    """Append one complete exact-item revision to a shared loadout identity."""
+
+    return functions.library.save_builder_loadout(
+        user_id,
+        class_type=character_class,
+        selections=dict(items_by_bucket),
+        name=name,
+        description=description,
+        tags=list(tags),
+        cover_icon_hash=cover_icon_hash,
+        loadout_id=loadout_id,
+    )
+
+
+def fork_selected_loadout_for_set(
+    functions: LoadoutFunctions,
+    user_id: str,
+    *,
+    loadout_id: str,
+    set_id: str,
+    character_class: int,
+    items_by_bucket: Mapping[int, str],
+    name: str,
+    description: str = "",
+    tags: Sequence[str] = (),
+    cover_icon_hash: int | None = None,
+) -> dict[str, Any]:
+    """Create an exact-item fork and replace all occurrences in one set."""
+
+    return functions.library.save_builder_loadout(
+        user_id,
+        class_type=character_class,
+        selections=dict(items_by_bucket),
+        name=name,
+        description=description,
+        tags=list(tags),
+        cover_icon_hash=cover_icon_hash,
+        loadout_id=loadout_id,
+        set_id=set_id,
     )
 
 
@@ -58,6 +116,7 @@ def save_in_game_slot(
     name: str,
     description: str = "",
     tags: Sequence[str] = (),
+    cover_icon_hash: int | None = None,
 ) -> dict[str, Any]:
     """Import one populated zero-based Bungie slot into the local library."""
 
@@ -68,6 +127,7 @@ def save_in_game_slot(
         name=name,
         description=description,
         tags=list(tags),
+        cover_icon_hash=cover_icon_hash,
     )
 
 
@@ -140,8 +200,9 @@ def update_loadout_details(
     name: str,
     description: str = "",
     tags: Sequence[str] = (),
+    cover_icon_hash: int | None = None,
 ) -> dict[str, Any]:
-    """Update mutable library metadata without changing the pinned revision."""
+    """Update shared metadata without creating a new exact-item revision."""
 
     return functions.library.update_metadata(
         user_id,
@@ -149,7 +210,18 @@ def update_loadout_details(
         name=name,
         description=description,
         tags=list(tags),
+        cover_icon_hash=cover_icon_hash,
     )
+
+
+def list_cover_icons(
+    functions: LoadoutFunctions,
+    user_id: str,
+) -> list[dict[str, Any]]:
+    """List official Destiny loadout icons available for local covers."""
+
+    del user_id
+    return functions.library.loadout_icons()
 
 
 def clone_loadout(
@@ -198,18 +270,6 @@ def compare_revisions(
         left_revision_id,
         right_revision_id,
     )
-
-
-def set_loadout_archived(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    loadout_id: str,
-    archived: bool,
-) -> None:
-    """Archive or restore one loadout without deleting pinned history."""
-
-    functions.library.set_archived(user_id, loadout_id, archived=archived)
 
 
 def set_loadout_favorite(

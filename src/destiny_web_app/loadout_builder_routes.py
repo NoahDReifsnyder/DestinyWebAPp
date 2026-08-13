@@ -13,13 +13,14 @@ from aiohttp import web
 
 from destiny_web_app.app_keys import (
     AUTH_SESSION_KEY,
-    INVENTORY_SERVICE_KEY,
+    LOADOUT_FUNCTIONS_KEY,
     LOADOUT_MANAGER_SERVICE_KEY,
 )
 from destiny_web_app.auth import csrf_input, require_csrf
 from destiny_web_app.bungie import BungieError
 from destiny_web_app.inventory import InventoryDataError
 from destiny_web_app.inventory_routes import icon_url
+from destiny_web_app.loadout_freshness import ensure_fresh_loadout_snapshot
 from destiny_web_app.loadout_manager import (
     CLASS_NAMES,
     GAMEPLAY_BUCKET_NAMES,
@@ -37,18 +38,53 @@ async def loadout_builder_page(request: web.Request) -> web.Response:
     authenticated = request.get(AUTH_SESSION_KEY)
     if authenticated is None:
         raise web.HTTPSeeOther("/")
+    edit_id = str(request.query.get("edit") or "")
+    set_id = str(request.query.get("set_id") or "")
+    editing = None
+    if edit_id:
+        editing = await asyncio.to_thread(
+            request.app[LOADOUT_MANAGER_SERVICE_KEY].saved_loadout,
+            authenticated.bungie_membership_id,
+            edit_id,
+            include_archived=True,
+        )
+        if editing is None:
+            raise web.HTTPNotFound()
+        class_type = int(editing["character_class_type"])
+    else:
+        try:
+            class_type = int(request.query.get("class", "0"))
+        except ValueError:
+            class_type = 0
     try:
-        class_type = int(request.query.get("class", "0"))
-    except ValueError:
-        class_type = 0
-    try:
+        await ensure_fresh_loadout_snapshot(request, authenticated)
         catalog = await asyncio.to_thread(
             request.app[LOADOUT_MANAGER_SERVICE_KEY].builder_catalog,
             authenticated.bungie_membership_id,
             class_type=class_type,
         )
-    except (LoadoutInspectionError, ManifestError, ValueError) as error:
+        icons = await asyncio.to_thread(
+            request.app[LOADOUT_MANAGER_SERVICE_KEY].loadout_icons
+        )
+        if editing is not None:
+            selected = {
+                int(item["bucket_hash"]): item["item_instance_id"]
+                for item in editing["items"]
+            }
+            for bucket in catalog["buckets"]:
+                bucket["choices"].sort(
+                    key=lambda choice: choice["instance_id"]
+                    != selected.get(int(bucket["bucket_hash"]))
+                )
+    except (
+        BungieError,
+        InventoryDataError,
+        LoadoutInspectionError,
+        ManifestError,
+        ValueError,
+    ) as error:
         catalog = None
+        icons = []
         error_html = notice(str(error), "error")
     else:
         error_html = ""
@@ -60,9 +96,15 @@ async def loadout_builder_page(request: web.Request) -> web.Response:
             + notice(request.query.get("error", ""), "error")
             + error_html
         ),
-        class_tabs=render_class_tabs(class_type),
+        class_tabs="" if editing else render_class_tabs(class_type),
         builder=(
-            render_builder(request, catalog) if catalog is not None else ""
+            render_builder(
+                request,
+                catalog,
+                editing=editing,
+                set_id=set_id,
+                icons=icons,
+            ) if catalog is not None else ""
         ),
     )
     response = web.Response(
@@ -83,10 +125,8 @@ async def save_builder_loadout(request: web.Request) -> web.StreamResponse:
         form = await request.post()
         require_csrf(request, form)
         class_type = int(str(form.get("class_type") or "-1"))
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         selections = {
             bucket_hash: str(form.get(f"bucket_{bucket_hash}") or "")
@@ -100,6 +140,9 @@ async def save_builder_loadout(request: web.Request) -> web.StreamResponse:
             name=str(form.get("name") or ""),
             description=str(form.get("description") or ""),
             tags=parse_tags(form.get("tags")),
+            cover_icon_hash=int(str(form.get("cover_icon_hash") or "0")),
+            loadout_id=str(form.get("loadout_id") or "") or None,
+            set_id=str(form.get("set_id") or "") or None,
         )
     except web.HTTPForbidden as error:
         failure = error.text or "The builder form was rejected."
@@ -132,6 +175,7 @@ async def loadout_builder_items(request: web.Request) -> web.Response:
         bucket_hash = int(request.query.get("bucket", "0"))
         offset = max(0, int(request.query.get("offset", "0")))
         query = " ".join(request.query.get("q", "").split()).lower()[:100]
+        await ensure_fresh_loadout_snapshot(request, authenticated)
         catalog = await asyncio.to_thread(
             request.app[LOADOUT_MANAGER_SERVICE_KEY].builder_catalog,
             authenticated.bungie_membership_id,
@@ -141,7 +185,14 @@ async def loadout_builder_items(request: web.Request) -> web.Response:
             row for row in catalog["buckets"]
             if int(row["bucket_hash"]) == bucket_hash
         )
-    except (LoadoutInspectionError, ManifestError, StopIteration, ValueError) as error:
+    except (
+        BungieError,
+        InventoryDataError,
+        LoadoutInspectionError,
+        ManifestError,
+        StopIteration,
+        ValueError,
+    ) as error:
         return web.json_response({"error": str(error)}, status=400)
     choices = bucket["choices"]
     if query:
@@ -179,23 +230,67 @@ def render_class_tabs(selected: int) -> str:
     )
 
 
-def render_builder(request: web.Request, catalog: dict) -> str:
-    buckets = "".join(render_bucket(bucket) for bucket in catalog["buckets"])
+def render_builder(
+    request: web.Request,
+    catalog: dict,
+    *,
+    editing: dict | None,
+    set_id: str,
+    icons: list[dict],
+) -> str:
+    selected = {
+        int(item["bucket_hash"]): item["item_instance_id"]
+        for item in (editing["items"] if editing else [])
+    }
+    buckets = "".join(
+        render_bucket(bucket, selected_instance=selected.get(bucket["bucket_hash"]))
+        for bucket in catalog["buckets"]
+    )
     disabled = "" if catalog["complete_catalog"] else " disabled"
+    is_fork = bool(editing and set_id)
+    name = (
+        f'{editing["name"]} · Set variant'
+        if is_fork
+        else editing["name"] if editing else ""
+    )
+    description = editing["description"] if editing else ""
+    tags = ", ".join(editing["tags"]) if editing else ""
+    icon_choices = "".join(
+        render_icon_choice(
+            icon,
+            selected_hash=(editing or {}).get("cover_icon_hash"),
+        )
+        for icon in icons
+    )
+    hidden_context = (
+        f'<input type="hidden" name="loadout_id" value="{escape(editing["loadout_id"])}">'
+        if editing else ""
+    ) + (
+        f'<input type="hidden" name="set_id" value="{escape(set_id)}">'
+        if set_id else ""
+    )
+    heading = "Name the new set-specific loadout" if is_fork else (
+        "Edit this loadout" if editing else f"Name this {escape(catalog['class_name'])} loadout"
+    )
+    button = "Create variant and update this set" if is_fork else (
+        "Save new revision" if editing else "Validate and save complete loadout"
+    )
     return f"""
 <form class="builder-form" method="post" action="/loadouts/builder/save">
   {csrf_input(request, '/loadouts/builder/save')}
   <input type="hidden" name="class_type" value="{catalog['class_type']}">
+  {hidden_context}
   <section class="builder-metadata">
     <div><p class="eyebrow">Complete revision only</p>
-      <h2>Name this {escape(catalog['class_name'])} loadout</h2>
+      <h2>{heading}</h2>
       <p>Selections stay in this browser until all ten exact gameplay slots
-      validate. Saving protects those exact instances from both cleaners.</p></div>
+      validate. Sockets remain read-only and are captured from live items.</p></div>
     <div class="manager-form">
-      <label>Name<input name="name" maxlength="80" required></label>
-      <label>Tags<input name="tags" maxlength="400" placeholder="raid, boss, damage"></label>
-      <label class="wide">Description<textarea name="description" maxlength="2000" rows="2"></textarea></label>
-      <button type="submit"{disabled}>Validate and save complete loadout</button>
+      <label>Name<input name="name" maxlength="80" required value="{escape(name)}"></label>
+      <label>Tags<input name="tags" maxlength="400" value="{escape(tags)}" placeholder="raid, boss, damage"></label>
+      <label class="wide">Description<textarea name="description" maxlength="2000" rows="2">{escape(description)}</textarea></label>
+      <fieldset class="wide"><legend>Cover icon</legend><div class="icon-picker">{icon_choices}</div></fieldset>
+      <button type="submit"{disabled}>{button}</button>
     </div>
   </section>
   <div class="builder-toolbar">
@@ -206,9 +301,13 @@ def render_builder(request: web.Request, catalog: dict) -> str:
 </form>"""
 
 
-def render_bucket(bucket: dict) -> str:
+def render_bucket(bucket: dict, *, selected_instance: str | None = None) -> str:
     choices = "".join(
-        render_choice(bucket["bucket_hash"], choice)
+        render_choice(
+            bucket["bucket_hash"],
+            choice,
+            selected=choice["instance_id"] == selected_instance,
+        )
         for choice in bucket["choices"][:6]
     )
     if not choices:
@@ -229,7 +328,9 @@ def render_bucket(bucket: dict) -> str:
 </fieldset>"""
 
 
-def render_choice(bucket_hash: int, choice: dict) -> str:
+def render_choice(
+    bucket_hash: int, choice: dict, *, selected: bool = False
+) -> str:
     image = (
         f'<img src="{escape(url)}" alt="">'
         if (url := icon_url(choice.get("icon_path")))
@@ -271,7 +372,7 @@ def render_choice(bucket_hash: int, choice: dict) -> str:
     return f"""
 <div class="builder-choice" data-search="{escape(search)}">
   <input type="radio" id="pick-{bucket_hash}-{escape(choice['instance_id'])}"
-    name="bucket_{bucket_hash}" value="{escape(choice['instance_id'])}" required{' disabled' if not choice['selectable'] else ''}>
+    name="bucket_{bucket_hash}" value="{escape(choice['instance_id'])}" required{' checked' if selected else ''}{' disabled' if not choice['selectable'] else ''}>
   <label for="pick-{bucket_hash}-{escape(choice['instance_id'])}">
     {image}<span class="builder-item-copy"><strong>{escape(choice['name'])}</strong>
       <small title="{escape(stat_detail)}">{escape(choice['type'])} · Power {choice['power'] or '—'} · Stats {stat_total}</small>
@@ -281,6 +382,21 @@ def render_choice(bucket_hash: int, choice: dict) -> str:
     </span>
   </label>
 </div>"""
+
+
+def render_icon_choice(icon: dict, *, selected_hash: int | None) -> str:
+    url = icon_url(icon.get("icon_path"))
+    art = (
+        f'<img src="{escape(url)}" alt="">'
+        if url
+        else '<span class="icon-fallback">◇</span>'
+    )
+    return (
+        f'<label class="icon-choice"><input type="radio" '
+        f'name="cover_icon_hash" value="{icon["hash"]}" required'
+        f'{" checked" if int(icon["hash"]) == int(selected_hash or 0) else ""}>'
+        f'<span>{art}<span class="sr-only">{escape(icon["name"])}</span></span></label>'
+    )
 
 
 def notice(value: str, tone: str) -> str:

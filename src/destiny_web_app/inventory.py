@@ -24,6 +24,7 @@ INVENTORY_COMPONENTS = (
     103,  # ProfileCurrencies
     200,  # Characters
     201,  # CharacterInventories
+    204,  # CharacterActivities (orbit/social-space safety evidence)
     205,  # CharacterEquipment
     206,  # CharacterLoadouts
     300,  # ItemInstances
@@ -41,6 +42,7 @@ INVENTORY_COMPONENTS = (
 
 VAULT_LOCATION = 2
 POSTMASTER_LOCATION = 4
+POSTMASTER_BUCKET_HASH = 215593132
 REQUIRED_ITEM_COMPONENTS = (
     "instances",
     "objectives",
@@ -364,9 +366,9 @@ def append_inventory_items(
                 if location == VAULT_LOCATION
                 else "profile_inventory"
             )
-        elif (
-            actual_source == "character_inventory"
-            and location == POSTMASTER_LOCATION
+        elif actual_source == "character_inventory" and (
+            location == POSTMASTER_LOCATION
+            or bucket_hash == POSTMASTER_BUCKET_HASH
         ):
             actual_source = "postmaster"
 

@@ -386,6 +386,7 @@ class LoadoutManagerService:
         tags: list[str] | None = None,
         loadout_id: str | None = None,
         revision_note: str = "",
+        cover_icon_hash: int | None = None,
     ) -> dict[str, Any]:
         """Save one character's complete current equipment as revision one."""
         name, description, tags = validate_metadata(
@@ -487,6 +488,7 @@ class LoadoutManagerService:
                 description=description,
                 tags=tags,
                 capture=capture,
+                cover_icon_hash=self.validate_cover_icon(cover_icon_hash),
             )
         else:
             saved = self.database.append_captured_loadout_revision(
@@ -727,6 +729,9 @@ class LoadoutManagerService:
         tags: list[str] | None = None,
         revision_action: str = "builder",
         source_identifiers: dict[str, int | None] | None = None,
+        cover_icon_hash: int | None = None,
+        loadout_id: str | None = None,
+        set_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate and persist one complete exact builder selection."""
         name, description, tags = validate_metadata(
@@ -822,19 +827,52 @@ class LoadoutManagerService:
                 **(source_identifiers or {}),
             },
         }
-        saved = self.database.save_captured_loadout(
-            bungie_membership_id,
-            name=name,
-            description=description,
-            tags=tags,
-            capture=capture,
-            revision_action=revision_action,
-            revision_note=(
-                "Imported from versioned application format"
-                if revision_action == "import"
-                else "Created from exact stored inventory selections"
-            ),
+        icon_hash = self.validate_cover_icon(
+            cover_icon_hash
+            if cover_icon_hash is not None
+            else valid_hash((source_identifiers or {}).get("iconHash"))
         )
+        if loadout_id is not None and set_id is None:
+            saved = self.database.append_captured_loadout_revision(
+                bungie_membership_id,
+                loadout_id,
+                capture=capture,
+                revision_note="Changed exact items in the loadout editor",
+                revision_action="builder_edit",
+            )
+            self.database.update_loadout_metadata(
+                bungie_membership_id,
+                loadout_id,
+                name=name,
+                description=description,
+                tags=tags,
+                cover_icon_hash=icon_hash,
+            )
+            saved = self.database.load_saved_loadout(
+                bungie_membership_id, loadout_id
+            )
+            assert saved is not None
+        else:
+            saved = self.database.save_captured_loadout(
+                bungie_membership_id,
+                name=name,
+                description=description,
+                tags=tags,
+                capture=capture,
+                revision_action=(
+                    "set_fork" if set_id is not None else revision_action
+                ),
+                revision_note=(
+                    "Forked by an exact-item edit within one loadout set"
+                    if set_id is not None
+                    else "Imported from versioned application format"
+                    if revision_action == "import"
+                    else "Created from exact stored inventory selections"
+                ),
+                cover_icon_hash=icon_hash,
+                replace_in_set_id=set_id,
+                replace_loadout_id=loadout_id,
+            )
         return self._enrich_saved(saved)
 
     def export_bundle(
@@ -863,8 +901,16 @@ class LoadoutManagerService:
                 "revisionNumber": int(loadout["revision_number"]),
                 "manifestVersion": loadout["manifest_version"],
                 "identifiers": {
-                    field: valid_hash(loadout["source_payload"].get(field))
-                    for field in ("nameHash", "iconHash", "colorHash")
+                    "nameHash": valid_hash(
+                        loadout["source_payload"].get("nameHash")
+                    ),
+                    "iconHash": (
+                        valid_hash(loadout.get("cover_icon_hash"))
+                        or valid_hash(loadout["source_payload"].get("iconHash"))
+                    ),
+                    "colorHash": valid_hash(
+                        loadout["source_payload"].get("colorHash")
+                    ),
                 },
                 "items": [
                     {
@@ -1024,6 +1070,7 @@ class LoadoutManagerService:
         name: str,
         description: str = "",
         tags: list[str] | None = None,
+        cover_icon_hash: int | None = None,
     ) -> dict[str, Any]:
         """Import one complete, currently resolvable in-game loadout slot."""
         name, description, tags = validate_metadata(
@@ -1035,6 +1082,120 @@ class LoadoutManagerService:
             bungie_membership_id,
             character_id,
         )
+        capture, raw_slot = self._prepare_in_game_slot_capture(
+            source,
+            character,
+            manifest_version=manifest_version,
+            character_id=character_id,
+            slot_index=slot_index,
+        )
+        saved = self.database.save_captured_loadout(
+            bungie_membership_id,
+            name=name,
+            description=description,
+            tags=tags,
+            capture=capture,
+            cover_icon_hash=self.validate_cover_icon(
+                cover_icon_hash
+                if cover_icon_hash is not None
+                else valid_hash(raw_slot.get("iconHash"))
+            ),
+        )
+        return self._enrich_saved(saved)
+
+    def prepare_character_loadout_set(
+        self,
+        bungie_membership_id: str,
+        *,
+        character_id: str,
+    ) -> dict[str, Any]:
+        """Prepare every populated slot for one atomic set import."""
+
+        source, character, manifest_version = self._capture_source(
+            bungie_membership_id,
+            character_id,
+        )
+        component = (
+            source["profile"]
+            .get("characterLoadouts", {})
+            .get("data", {})
+            .get(character_id)
+        )
+        slots = component.get("loadouts") if isinstance(component, dict) else None
+        if not isinstance(slots, list):
+            raise LoadoutInspectionError(
+                "The selected character has no loadout component."
+            )
+        if len(slots) > 20:
+            raise LoadoutInspectionError(
+                "The selected character returned more than 20 loadout slots."
+            )
+        inspection = self.inspect(bungie_membership_id)
+        inspected_character = next(
+            (
+                value
+                for value in (inspection or {}).get("characters", [])
+                if value["character_id"] == character_id
+            ),
+            None,
+        )
+        inspected_slots = {
+            int(value["slot_index"]): value
+            for value in (
+                inspected_character["slots"] if inspected_character else []
+            )
+        }
+        official_icons = {row["hash"] for row in self.loadout_icons()}
+        prepared = []
+        for position, raw_slot in enumerate(slots):
+            raw_items = raw_slot.get("items") if isinstance(raw_slot, dict) else None
+            if not isinstance(raw_items, list) or not raw_items:
+                continue
+            display_slot = inspected_slots.get(position, {})
+            capture, captured_slot = self._prepare_in_game_slot_capture(
+                source,
+                character,
+                manifest_version=manifest_version,
+                character_id=character_id,
+                slot_index=position,
+            )
+            icon_hash = valid_hash(captured_slot.get("iconHash"))
+            prepared.append(
+                {
+                    "position": position,
+                    "name": validate_metadata(
+                        str(display_slot.get("name") or f"Slot {position + 1}"),
+                        "",
+                        [],
+                    )[0],
+                    "description": "",
+                    "tags": [],
+                    "cover_icon_hash": (
+                        icon_hash if icon_hash in official_icons else None
+                    ),
+                    "capture": capture,
+                }
+            )
+        if not prepared:
+            raise LoadoutInspectionError(
+                "The selected character has no populated in-game loadouts."
+            )
+        return {
+            "character_class_type": int(character["class_type"]),
+            "loadouts": prepared,
+        }
+
+    def _prepare_in_game_slot_capture(
+        self,
+        source: dict[str, Any],
+        character: dict[str, Any],
+        *,
+        manifest_version: str,
+        character_id: str,
+        slot_index: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build immutable capture data without writing it to SQLite."""
+
         component = (
             source["profile"]
             .get("characterLoadouts", {})
@@ -1068,6 +1229,7 @@ class LoadoutManagerService:
         item_hashes: set[int] = set()
         plug_hashes: set[int] = set()
         captured = []
+        unresolved_instance_ids: list[str] = []
         parsed_plugs: dict[str, list[int | None]] = {}
         for equipment_order, raw_item in enumerate(raw_items):
             if not isinstance(raw_item, dict):
@@ -1077,10 +1239,9 @@ class LoadoutManagerService:
             instance_id = valid_instance_id(raw_item.get("itemInstanceId"))
             inventory_item = item_index.get(instance_id or "")
             if inventory_item is None:
-                raise LoadoutInspectionError(
-                    "The selected slot references an exact item that is no "
-                    "longer owned. Choose a fully resolved slot."
-                )
+                if instance_id is not None:
+                    unresolved_instance_ids.append(instance_id)
+                continue
             raw_plugs = ordered_hashes(raw_item.get("plugItemHashes"))
             parsed_plugs[instance_id] = raw_plugs
             plug_hashes.update(
@@ -1113,7 +1274,14 @@ class LoadoutManagerService:
                 filtered_categories,
             )
             item["plugs"] = captured_plugs(plug_rows)
-        ensure_complete_capture(captured)
+        for equipment_order, item in enumerate(captured):
+            item["equipment_order"] = equipment_order
+        ensure_complete_capture(captured, allow_partial=True)
+        partial = (
+            bool(unresolved_instance_ids)
+            or {int(item["bucket_hash"]) for item in captured}
+            != REQUIRED_GAMEPLAY_BUCKETS
+        )
 
         capture = {
             "snapshot_id": source["snapshot"]["snapshot_id"],
@@ -1123,16 +1291,15 @@ class LoadoutManagerService:
             "source_slot_index": slot_index,
             "character_class_type": int(character["class_type"]),
             "items": captured,
-            "source_payload": raw_slot,
+            "partial": partial,
+            "unresolved_item_instance_ids": unresolved_instance_ids,
+            "source_payload": {
+                **raw_slot,
+                "_partialCapture": partial,
+                "_unresolvedItemInstanceIds": unresolved_instance_ids,
+            },
         }
-        saved = self.database.save_captured_loadout(
-            bungie_membership_id,
-            name=name,
-            description=description,
-            tags=tags,
-            capture=capture,
-        )
-        return self._enrich_saved(saved)
+        return capture, raw_slot
 
     def saved_loadouts(
         self,
@@ -1191,14 +1358,23 @@ class LoadoutManagerService:
         name: str,
         description: str,
         tags: list[str],
+        cover_icon_hash: int | None = None,
     ) -> dict[str, Any]:
         name, description, tags = validate_metadata(name, description, tags)
+        if cover_icon_hash is None:
+            current = self.database.load_saved_loadout(
+                bungie_membership_id, loadout_id, include_archived=True
+            )
+            if current is None:
+                raise LoadoutInspectionError("The saved loadout is unavailable.")
+            cover_icon_hash = valid_hash(current.get("cover_icon_hash"))
         self.database.update_loadout_metadata(
             bungie_membership_id,
             loadout_id,
             name=name,
             description=description,
             tags=tags,
+            cover_icon_hash=self.validate_cover_icon(cover_icon_hash),
         )
         saved = self.saved_loadout(
             bungie_membership_id,
@@ -1346,6 +1522,50 @@ class LoadoutManagerService:
             )
         return {"left": left, "right": right, "rows": rows}
 
+    def loadout_icons(self) -> list[dict[str, Any]]:
+        """Return Bungie's current official loadout icon choices."""
+
+        if not self.manifest.status().get("available"):
+            raise LoadoutInspectionError(
+                "Prepare the current Destiny definitions before choosing an icon."
+            )
+        constants = self.manifest.resolve_all(
+            "DestinyLoadoutConstantsDefinition"
+        )
+        hashes = {
+            int(value)
+            for definition in constants.values()
+            for value in definition.get("loadoutIconHashes", [])
+            if isinstance(value, int)
+        }
+        definitions = self.manifest.resolve_many(
+            "DestinyLoadoutIconDefinition", hashes
+        )
+        return [
+            {
+                "hash": icon_hash,
+                "icon_path": (
+                    definition_path(definition, "iconImagePath")
+                    or display_icon(definition)
+                ),
+                "name": display_name(definition) or f"Icon {icon_hash}",
+            }
+            for icon_hash, definition in sorted(definitions.items())
+            if icon_hash in hashes
+        ]
+
+    def validate_cover_icon(self, value: int | None) -> int | None:
+        if value is None:
+            return None
+        icon_hash = valid_hash(value)
+        if icon_hash is None or icon_hash not in {
+            row["hash"] for row in self.loadout_icons()
+        }:
+            raise LoadoutInspectionError(
+                "Choose an icon from the current Destiny loadout icon catalog."
+            )
+        return icon_hash
+
     def _capture_source(
         self,
         bungie_membership_id: str,
@@ -1479,6 +1699,14 @@ class LoadoutManagerService:
             int(loadout["character_class_type"]), "Guardian"
         )
         loadout["item_count"] = len(loadout["items"])
+        loadout["partial"] = bool(
+            loadout["canonical_payload"].get("partial")
+        )
+        loadout["unresolved_item_count"] = len(
+            loadout["canonical_payload"].get(
+                "unresolved_item_instance_ids", []
+            )
+        )
         loadout["plug_count"] = sum(
             len(item["plugs"]) for item in loadout["items"]
         )
@@ -1488,6 +1716,18 @@ class LoadoutManagerService:
         loadout["validation_issues"] = validation_issues
         loadout["live_status"] = (
             "invalid" if validation_issues else "valid"
+        )
+        icon_hash = valid_hash(loadout.get("cover_icon_hash"))
+        icon_definition = (
+            self.manifest.resolve_many(
+                "DestinyLoadoutIconDefinition", (icon_hash,)
+            ).get(icon_hash)
+            if icon_hash is not None and self.manifest.status().get("available")
+            else None
+        )
+        loadout["cover_icon_path"] = (
+            definition_path(icon_definition, "iconImagePath")
+            or display_icon(icon_definition)
         )
         return loadout
 
@@ -1747,9 +1987,13 @@ def reference_item(
     }
 
 
-def ensure_complete_capture(items: list[dict[str, Any]]) -> None:
-    """Reject partial or structurally ambiguous application loadouts."""
-    if not items:
+def ensure_complete_capture(
+    items: list[dict[str, Any]],
+    *,
+    allow_partial: bool = False,
+) -> None:
+    """Reject structurally ambiguous captures and optional partial state."""
+    if not items and not allow_partial:
         raise LoadoutInspectionError("An empty loadout cannot be saved.")
     orders = [int(item["equipment_order"]) for item in items]
     if orders != list(range(len(items))):
@@ -1767,7 +2011,7 @@ def ensure_complete_capture(items: list[dict[str, Any]]) -> None:
             "The captured equipment contains multiple items for one slot."
         )
     missing_buckets = REQUIRED_GAMEPLAY_BUCKETS - set(bucket_hashes)
-    if missing_buckets:
+    if missing_buckets and not allow_partial:
         raise LoadoutInspectionError(
             "The capture is incomplete: one or more required gameplay slots "
             "are missing."

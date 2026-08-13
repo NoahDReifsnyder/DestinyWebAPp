@@ -400,6 +400,9 @@ class BungieClient:
         loadout_index: int,
         character_id: str,
         membership_type: int,
+        color_hash: int | None = None,
+        icon_hash: int | None = None,
+        name_hash: int | None = None,
     ) -> dict[str, Any]:
         """Snapshot currently equipped state into one zero-based game slot."""
 
@@ -409,9 +412,9 @@ class BungieClient:
             {
                 # Bungie's endpoint rejects the request if these nullable
                 # members of DestinyLoadoutUpdateActionRequest are omitted.
-                "colorHash": None,
-                "iconHash": None,
-                "nameHash": None,
+                "colorHash": color_hash,
+                "iconHash": icon_hash,
+                "nameHash": name_hash,
                 "loadoutIndex": loadout_index,
                 "characterId": character_id,
                 "membershipType": membership_type,

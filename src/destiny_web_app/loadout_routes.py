@@ -17,18 +17,22 @@ from aiohttp import web
 from destiny_web_app.app_keys import (
     ACTIVITY_PLAN_SERVICE_KEY,
     AUTH_SESSION_KEY,
-    INVENTORY_SERVICE_KEY,
+    LOADOUT_FUNCTIONS_KEY,
     LOADOUT_MANAGER_SERVICE_KEY,
 )
 from destiny_web_app.auth import csrf_input, require_csrf
 from destiny_web_app.bungie import BungieError
 from destiny_web_app.inventory import InventoryDataError
 from destiny_web_app.inventory_routes import icon_url
+from destiny_web_app.loadout_freshness import ensure_fresh_loadout_snapshot
 from destiny_web_app.loadout_manager import (
+    CLASS_NAMES,
     LoadoutInspectionError,
     snapshot_is_fresh,
 )
 from destiny_web_app.manifest import ManifestError
+from destiny_web_app.loadouts.library import list_loadouts
+from destiny_web_app.loadouts.sets import list_loadout_sets
 
 
 TEMPLATE_ROOT = Path(__file__).with_name("templates")
@@ -39,91 +43,68 @@ async def loadout_manager_page(request: web.Request) -> web.Response:
     authenticated = request.get(AUTH_SESSION_KEY)
     if authenticated is None:
         raise web.HTTPSeeOther("/")
+    functions = request.app[LOADOUT_FUNCTIONS_KEY]
     try:
-        inspection, saved_loadouts, activity_plans = await asyncio.gather(
+        await ensure_fresh_loadout_snapshot(request, authenticated)
+        saved_loadouts, loadout_sets, source = await asyncio.gather(
             asyncio.to_thread(
-                request.app[LOADOUT_MANAGER_SERVICE_KEY].inspect,
+                list_loadouts,
+                functions,
+                authenticated.bungie_membership_id,
+                include_archived=False,
+            ),
+            asyncio.to_thread(
+                list_loadout_sets,
+                functions,
                 authenticated.bungie_membership_id,
             ),
             asyncio.to_thread(
-                request.app[LOADOUT_MANAGER_SERVICE_KEY].saved_loadouts,
+                functions.store.load_active_loadout_source,
                 authenticated.bungie_membership_id,
-                include_archived=True,
-            ),
-            asyncio.to_thread(
-                request.app[ACTIVITY_PLAN_SERVICE_KEY].plans,
-                authenticated.bungie_membership_id,
-                include_archived=True,
             ),
         )
-    except (LoadoutInspectionError, ManifestError, ValueError) as error:
-        inspection = None
-        saved_loadouts = []
-        activity_plans = []
-        error_html = notice(str(error), "error")
-    else:
         error_html = ""
-
-    if inspection is None:
-        body = empty_state()
-        summary = summary_cards(None)
-        capability_matrix = ""
-        warnings = error_html
-        snapshot_label = "No snapshot"
-        snapshot_tone = "muted"
-    else:
-        body = render_characters(inspection["characters"])
-        summary = summary_cards(inspection)
-        capability_matrix = render_capability_matrix(
-            inspection["capabilities"]
-        )
-        warning_rows = [
-            notice(message, "warning")
-            for message in inspection["warnings"]
-        ]
-        if not snapshot_is_fresh(inspection["snapshot"]):
-            warning_rows.insert(
-                0,
-                notice(
-                    "This inspection uses a stale or previously retained "
-                    "snapshot. Synchronize inventory before using it as live "
-                    "evidence.",
-                    "warning",
-                ),
-            )
-        warnings = error_html + "".join(warning_rows)
-        snapshot_label = snapshot_age(inspection["snapshot"])
-        snapshot_tone = (
-            "fresh" if snapshot_is_fresh(inspection["snapshot"]) else "stale"
-        )
-
+    except (
+        BungieError,
+        InventoryDataError,
+        LoadoutInspectionError,
+        ManifestError,
+        ValueError,
+    ) as error:
+        saved_loadouts, loadout_sets, source = [], [], None
+        error_html = notice(str(error), "error")
     warnings = (
         message_html(request.query.get("notice", ""), "success")
         + message_html(request.query.get("error", ""), "error")
-        + warnings
-    )
-    saved_loadouts, library_filters = filter_saved_loadouts(
-        saved_loadouts,
-        query=request.query.get("q", ""),
-        class_filter=request.query.get("class", ""),
-        tag_filter=request.query.get("tag", ""),
-        view=request.query.get("view", "active"),
+        + error_html
     )
     html = render_template(
         "loadouts.html",
         guardian_name=escape(authenticated.display_name),
-        snapshot_label=escape(snapshot_label),
-        snapshot_tone=snapshot_tone,
         warnings=warnings,
-        summary=summary,
-        capability_matrix=capability_matrix,
-        capture_form=render_capture_form(request, inspection),
-        library_filters=library_filters,
-        saved_library=render_saved_library(saved_loadouts),
-        import_card=render_import_card(request),
-        plan_creator=render_plan_creator(request),
-        activity_plans=render_activity_plans(activity_plans),
-        body=body,
+        loadout_count=str(len(saved_loadouts)),
+        set_count=str(len(loadout_sets)),
+        set_sections=(
+            "".join(
+                render_dashboard_set(
+                    board,
+                    preview_csrf=csrf_input(
+                        request, "/loadout-sets/preview"
+                    ),
+                )
+                for board in loadout_sets
+            )
+            or '<div class="dashboard-empty">No sets yet.</div>'
+        ),
+        all_loadouts=render_all_dashboard_loadouts(saved_loadouts),
+        create_set_csrf=csrf_input(request, "/loadout-sets/create"),
+        import_set_csrf=csrf_input(
+            request, "/loadout-sets/create-from-character"
+        ),
+        character_options=render_set_character_options(source),
+        import_set_disabled=(
+            "" if source and source.get("characters") else " disabled"
+        ),
     )
     response = web.Response(
         text=html,
@@ -132,6 +113,16 @@ async def loadout_manager_page(request: web.Request) -> web.Response:
     )
     response.enable_compression()
     return response
+
+
+def render_set_character_options(source: dict[str, Any] | None) -> str:
+    return "".join(
+        f'<option value="{escape(str(character["character_id"]))}">'
+        f'{escape(CLASS_NAMES.get(int(character.get("class_type", 3)), "Guardian"))}'
+        "</option>"
+        for character in (source or {}).get("characters", [])
+        if int(character.get("class_type", 3)) in (0, 1, 2)
+    )
 
 
 async def loadout_slot_page(request: web.Request) -> web.Response:
@@ -149,11 +140,18 @@ async def loadout_slot_page(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
 
     try:
+        await ensure_fresh_loadout_snapshot(request, authenticated)
         inspection = await asyncio.to_thread(
             request.app[LOADOUT_MANAGER_SERVICE_KEY].inspect,
             authenticated.bungie_membership_id,
         )
-    except (LoadoutInspectionError, ManifestError, ValueError) as error:
+    except (
+        BungieError,
+        InventoryDataError,
+        LoadoutInspectionError,
+        ManifestError,
+        ValueError,
+    ) as error:
         return loadout_error_response(authenticated.display_name, str(error))
     if inspection is None:
         raise web.HTTPSeeOther("/loadouts")
@@ -209,10 +207,8 @@ async def capture_current_loadout(request: web.Request) -> web.StreamResponse:
     try:
         form = await request.post()
         require_csrf(request, form)
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         saved = await asyncio.to_thread(
             request.app[LOADOUT_MANAGER_SERVICE_KEY].capture_current_equipment,
@@ -257,10 +253,8 @@ async def import_in_game_loadout(request: web.Request) -> web.StreamResponse:
             return_path = (
                 f"/loadouts/{quote(character_id, safe='')}/{slot_index}"
             )
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         saved = await asyncio.to_thread(
             request.app[LOADOUT_MANAGER_SERVICE_KEY].import_in_game_slot,
@@ -270,6 +264,11 @@ async def import_in_game_loadout(request: web.Request) -> web.StreamResponse:
             name=str(form.get("name") or ""),
             description=str(form.get("description") or ""),
             tags=parse_tags(form.get("tags")),
+            cover_icon_hash=(
+                int(str(form.get("cover_icon_hash")))
+                if form.get("cover_icon_hash")
+                else None
+            ),
         )
     except web.HTTPForbidden as error:
         query = urlencode({"error": error.text or "The import form was rejected."})
@@ -298,23 +297,39 @@ async def saved_loadout_page(request: web.Request) -> web.Response:
         raise web.HTTPSeeOther("/")
     service = request.app[LOADOUT_MANAGER_SERVICE_KEY]
     loadout_id = request.match_info["loadout_id"]
-    loadout, revisions, inspection = await asyncio.gather(
-        asyncio.to_thread(
-            service.saved_loadout,
-            authenticated.bungie_membership_id,
-            loadout_id,
-            include_archived=True,
-        ),
-        asyncio.to_thread(
-            service.loadout_revisions,
-            authenticated.bungie_membership_id,
-            loadout_id,
-        ),
-        asyncio.to_thread(
-            service.inspect,
-            authenticated.bungie_membership_id,
-        ),
-    )
+    try:
+        await ensure_fresh_loadout_snapshot(request, authenticated)
+        loadout, revisions, inspection, icons, usages = await asyncio.gather(
+            asyncio.to_thread(
+                service.saved_loadout,
+                authenticated.bungie_membership_id,
+                loadout_id,
+                include_archived=True,
+            ),
+            asyncio.to_thread(
+                service.loadout_revisions,
+                authenticated.bungie_membership_id,
+                loadout_id,
+            ),
+            asyncio.to_thread(
+                service.inspect,
+                authenticated.bungie_membership_id,
+            ),
+            asyncio.to_thread(service.loadout_icons),
+            asyncio.to_thread(
+                request.app[LOADOUT_FUNCTIONS_KEY].sets.usages,
+                authenticated.bungie_membership_id,
+                loadout_id,
+            ),
+        )
+    except (
+        BungieError,
+        InventoryDataError,
+        LoadoutInspectionError,
+        ManifestError,
+        ValueError,
+    ) as error:
+        return loadout_error_response(authenticated.display_name, str(error))
     if loadout is None:
         raise web.HTTPNotFound()
     comparison = ""
@@ -355,8 +370,11 @@ async def saved_loadout_page(request: web.Request) -> web.Response:
             else ""
         ),
         tags=render_tags(loadout["tags"]),
+        cover_icon=dashboard_icon(loadout),
+        set_usages=render_set_usages(usages),
+        edit_link=render_exact_edit_link(request, loadout),
         loadout_controls=render_loadout_controls(
-            request, loadout, revisions, characters
+            request, loadout, revisions, characters, icons
         ),
         comparison=comparison,
         revision_history=render_loadout_revision_history(
@@ -384,6 +402,11 @@ async def update_saved_loadout(request: web.Request) -> web.StreamResponse:
             name=str(form.get("name") or ""),
             description=str(form.get("description") or ""),
             tags=parse_tags(form.get("tags")),
+            cover_icon_hash=(
+                int(str(form.get("cover_icon_hash")))
+                if form.get("cover_icon_hash")
+                else None
+            ),
         ),
         "Loadout metadata updated.",
     )
@@ -398,10 +421,8 @@ async def revise_saved_loadout(request: web.Request) -> web.StreamResponse:
         form = await request.post()
         require_csrf(request, form)
         loadout_id = str(form.get("loadout_id") or "")
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         saved = await asyncio.to_thread(
             request.app[LOADOUT_MANAGER_SERVICE_KEY].revise_with_current_equipment,
@@ -541,10 +562,8 @@ async def import_saved_loadout_bundle(request: web.Request) -> web.StreamRespons
         bundle = json.loads(raw)
         if not isinstance(bundle, dict):
             raise LoadoutInspectionError("The import must be a JSON object.")
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         if bundle.get("format") == "destiny-web-app/activity-plan":
             imported = await asyncio.to_thread(
@@ -634,6 +653,7 @@ def render_loadout_controls(
     loadout: dict[str, Any],
     revisions: list[dict[str, Any]],
     characters: list[dict[str, Any]],
+    icons: list[dict[str, Any]],
 ) -> str:
     loadout_id = escape(loadout["loadout_id"])
     archived = bool(loadout["archived_at"])
@@ -648,6 +668,12 @@ def render_loadout_controls(
         f'<option value="{escape(row["revision_id"])}">'
         f'Revision {row["revision_number"]} · {escape(row["revision_action"])}</option>'
         for row in revisions
+    )
+    icon_choices = "".join(
+        render_metadata_icon_choice(
+            row, selected_hash=loadout.get("cover_icon_hash")
+        )
+        for row in icons
     )
     return f"""
 <section class="manager-grid">
@@ -669,16 +695,8 @@ def render_loadout_controls(
       <label>Name<input name="name" maxlength="80" required value="{escape(loadout['name'])}"{disabled}></label>
       <label>Tags<input name="tags" maxlength="400" value="{escape(', '.join(loadout['tags']))}"{disabled}></label>
       <label class="wide">Description<textarea name="description" maxlength="2000" rows="3"{disabled}>{escape(loadout['description'])}</textarea></label>
+      <fieldset class="wide"><legend>Cover icon</legend><div class="icon-picker">{icon_choices}</div></fieldset>
       <button type="submit"{disabled}>Save metadata</button>
-    </form>
-  </details>
-  <details class="manager-panel"><summary>Capture a new revision</summary>
-    <form class="manager-form" method="post" action="/loadouts/saved/revise">
-      {csrf_input(request, '/loadouts/saved/revise')}
-      <input type="hidden" name="loadout_id" value="{loadout_id}">
-      <label>Character<select name="character_id" required{disabled}>{character_options}</select></label>
-      <label>Revision note<input name="revision_note" maxlength="500" placeholder="Changed encounter strategy"{disabled}></label>
-      <button type="submit"{disabled or (' disabled' if not character_options else '')}>Refresh and capture current equipment</button>
     </form>
   </details>
   <details class="manager-panel"><summary>Clone this loadout</summary>
@@ -697,6 +715,50 @@ def render_loadout_controls(
     </form>
   </details>
 </section>"""
+
+
+def render_metadata_icon_choice(
+    icon: dict[str, Any], *, selected_hash: int | None
+) -> str:
+    path = icon.get("icon_path")
+    url = icon_url(path) if path else ""
+    art = (
+        f'<img src="{escape(url)}" alt="">'
+        if url
+        else '<span class="icon-fallback">◇</span>'
+    )
+    return (
+        f'<label class="icon-choice"><input type="radio" '
+        f'name="cover_icon_hash" value="{icon["hash"]}" required'
+        f'{" checked" if int(icon["hash"]) == int(selected_hash or 0) else ""}>'
+        f'<span>{art}<span class="sr-only">{escape(icon["name"])}</span></span></label>'
+    )
+
+
+def render_set_usages(usages: list[dict[str, Any]]) -> str:
+    if not usages:
+        return '<p class="usage-empty">This loadout is not currently used by a set.</p>'
+    return "".join(
+        f'<a class="usage-chip" href="/loadout-sets/{quote(row["set_id"], safe="")}">'
+        f'{escape(row["name"])} · slots '
+        f'{", ".join(str(position + 1) for position in row["positions"])}</a>'
+        for row in usages
+    )
+
+
+def render_exact_edit_link(
+    request: web.Request, loadout: dict[str, Any]
+) -> str:
+    set_id = str(request.query.get("set_id") or "")
+    query = {"edit": loadout["loadout_id"]}
+    label = "Edit exact items"
+    if set_id:
+        query["set_id"] = set_id
+        label = "Create a set-specific item variant"
+    return (
+        f'<a class="primary-action" href="/loadouts/builder?{urlencode(query)}">'
+        f'{escape(label)}</a>'
+    )
 
 
 def render_loadout_revision_history(
@@ -752,16 +814,9 @@ def render_local_loadout_controls(
     request: web.Request,
     loadout: dict[str, Any],
 ) -> str:
-    archived = bool(loadout["archived_at"])
     return f"""
-<section class="danger-zone"><div><p class="eyebrow">Local controls</p><h2>Archive or delete</h2>
-  <p>Neither action changes Destiny. A plan-pinned loadout cannot be deleted.</p></div>
-  <form method="post" action="/loadouts/saved/archive">
-    {csrf_input(request, '/loadouts/saved/archive')}
-    <input type="hidden" name="loadout_id" value="{escape(loadout['loadout_id'])}">
-    <input type="hidden" name="archived" value="{'0' if archived else '1'}">
-    <button type="submit">{'Restore from archive' if archived else 'Archive loadout'}</button>
-  </form>
+<section class="danger-zone"><div><p class="eyebrow">Local controls</p><h2>Export or delete</h2>
+  <p>Deletion never changes Destiny and is blocked while any set uses this loadout.</p></div>
   <form method="post" action="/loadouts/saved/favorite">
     {csrf_input(request, '/loadouts/saved/favorite')}
     <input type="hidden" name="loadout_id" value="{escape(loadout['loadout_id'])}">
@@ -864,6 +919,88 @@ def render_saved_library(loadouts: list[dict[str, Any]]) -> str:
   </div>
   <div class="saved-grid">{cards}</div>
 </section>"""
+
+
+def render_dashboard_set(
+    board: dict[str, Any], *, preview_csrf: str = ""
+) -> str:
+    slots = {int(row["position"]): row["loadout"] for row in board["slots"]}
+    cells = "".join(
+        render_dashboard_cell(
+            slots.get(position),
+            position=position,
+            set_id=board["set_id"],
+        )
+        for position in range(20)
+    )
+    return f"""
+<details class="dashboard-section set-dashboard-section">
+  <summary><span><strong>{escape(board['name'])}</strong>
+    <small>{escape(board['class_name'])} · {board['filled_count']} of 20 filled</small></span>
+    <span class="section-chevron" aria-hidden="true">⌄</span></summary>
+  <div class="dashboard-section-body">
+    <div class="dashboard-board">{cells}</div>
+    <div class="dashboard-set-actions">
+      <form method="post" action="/loadout-sets/preview">
+        {preview_csrf}
+        <input type="hidden" name="set_id" value="{escape(board['set_id'])}">
+        <button class="primary-action" type="submit"{' disabled' if not board['filled_count'] else ''}>Preview applying set</button>
+      </form>
+      <a class="secondary-action" href="/loadout-sets/{quote(board['set_id'], safe='')}">Edit set</a>
+    </div>
+  </div>
+</details>"""
+
+
+def render_dashboard_cell(
+    loadout: dict[str, Any] | None,
+    *,
+    position: int,
+    set_id: str,
+) -> str:
+    if loadout is None:
+        return (
+            f'<span class="dashboard-cell empty" title="Empty · Destiny slot {position + 1}">'
+            f'<span class="slot-number">{position + 1}</span></span>'
+        )
+    href = (
+        f'/loadouts/saved/{quote(loadout["loadout_id"], safe="")}'
+        f'?set_id={quote(set_id, safe="")}&position={position}'
+    )
+    art = dashboard_icon(loadout)
+    return f"""
+<a class="dashboard-cell occupied" href="{escape(href, quote=True)}"
+ title="{escape(loadout['name'])} · Destiny slot {position + 1}"
+ aria-label="Open {escape(loadout['name'])}, Destiny slot {position + 1}">
+ <span class="slot-number">{position + 1}</span>{art}
+</a>"""
+
+
+def render_all_dashboard_loadouts(loadouts: list[dict[str, Any]]) -> str:
+    groups = []
+    for class_type, class_name in ((0, "Titan"), (1, "Hunter"), (2, "Warlock")):
+        rows = [
+            row for row in loadouts
+            if int(row["character_class_type"]) == class_type
+        ]
+        icons = "".join(
+            f'<a class="library-icon" href="/loadouts/saved/{quote(row["loadout_id"], safe="")}" '
+            f'title="{escape(row["name"])}" aria-label="Open {escape(row["name"])}">'
+            f'{dashboard_icon(row)}</a>'
+            for row in rows
+        ) or '<span class="class-empty">No saved loadouts.</span>'
+        groups.append(
+            f'<section class="class-loadouts"><h3>{class_name}</h3><div class="library-icon-grid">{icons}</div></section>'
+        )
+    return "".join(groups)
+
+
+def dashboard_icon(loadout: dict[str, Any]) -> str:
+    path = loadout.get("cover_icon_path")
+    url = icon_url(path) if path else ""
+    if url:
+        return f'<img src="{escape(url)}" alt="">'
+    return f'<span class="icon-fallback">{escape(loadout["class_name"][:1])}</span>'
 
 
 def render_saved_card(loadout: dict[str, Any]) -> str:
@@ -1017,6 +1154,11 @@ def render_saved_status(loadout: dict[str, Any]) -> str:
         if issues
         else "<p>Every exact item is still in its captured location.</p>"
     )
+    if loadout.get("partial"):
+        issue_rows += (
+            "<p>This is a partial Destiny loadout. Missing items and blank "
+            "sockets intentionally keep their current setting when applied.</p>"
+        )
     return f"""
 <section class="saved-status {escape(loadout['live_status'])}">
   <strong>{escape(loadout['live_status'])}</strong>

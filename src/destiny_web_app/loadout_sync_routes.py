@@ -15,13 +15,13 @@ from aiohttp import web
 
 from destiny_web_app.app_keys import (
     AUTH_SESSION_KEY,
-    INVENTORY_SERVICE_KEY,
     LOADOUT_SYNC_SERVICE_KEY,
 )
 from destiny_web_app.auth import csrf_input, require_csrf
 from destiny_web_app.bungie import BungieError
 from destiny_web_app.inventory import InventoryDataError
 from destiny_web_app.inventory_routes import icon_url
+from destiny_web_app.loadout_freshness import ensure_fresh_loadout_snapshot
 from destiny_web_app.loadout_sync import (
     LoadoutOperationError,
     LoadoutPreviewError,
@@ -41,6 +41,10 @@ async def create_activity_plan_preview(request: web.Request) -> web.StreamRespon
     return await create_preview(request, preview_type="activity_plan")
 
 
+async def create_loadout_set_preview(request: web.Request) -> web.StreamResponse:
+    return await create_preview(request, preview_type="loadout_set")
+
+
 async def create_preview(request: web.Request, *, preview_type: str) -> web.StreamResponse:
     authenticated = request.get(AUTH_SESSION_KEY)
     if authenticated is None:
@@ -49,10 +53,8 @@ async def create_preview(request: web.Request, *, preview_type: str) -> web.Stre
     try:
         form = await request.post()
         require_csrf(request, form)
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         service = request.app[LOADOUT_SYNC_SERVICE_KEY]
         if preview_type == "single_slot":
@@ -66,13 +68,21 @@ async def create_preview(request: web.Request, *, preview_type: str) -> web.Stre
                 target_character_id=str(form.get("target_character_id") or ""),
                 target_slot_index=display_slot(form.get("target_slot")),
             )
-        else:
+        elif preview_type == "activity_plan":
             plan_id = str(form.get("plan_id") or "")
             return_path = f"/loadout-plans/{quote(plan_id, safe='')}"
             preview = await asyncio.to_thread(
                 service.create_plan_preview,
                 authenticated.bungie_membership_id,
                 plan_id=plan_id,
+            )
+        else:
+            set_id = str(form.get("set_id") or "")
+            return_path = f"/loadout-sets/{quote(set_id, safe='')}"
+            preview = await asyncio.to_thread(
+                service.create_set_preview,
+                authenticated.bungie_membership_id,
+                set_id=set_id,
             )
     except web.HTTPForbidden as error:
         failure = error.text or "The preview form was rejected."
@@ -141,17 +151,36 @@ async def confirm_loadout_preview(request: web.Request) -> web.StreamResponse:
                 "Check the explicit confirmation before starting live writes."
             )
         backup_choice = str(form.get("backup_choice") or "")
-        await request.app[INVENTORY_SERVICE_KEY].synchronize(
-            bungie_membership_id=authenticated.bungie_membership_id,
-            access_token=authenticated.token.access_token,
-            force=True,
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
         )
         service = request.app[LOADOUT_SYNC_SERVICE_KEY]
-        preview = await asyncio.to_thread(
-            service.validate_preview_state,
-            authenticated.bungie_membership_id,
-            preview_id,
-        )
+        try:
+            preview = await asyncio.to_thread(
+                service.validate_preview_state,
+                authenticated.bungie_membership_id,
+                preview_id,
+            )
+        except LoadoutPreviewError:
+            preview = await asyncio.to_thread(
+                service.rebuild_preview,
+                authenticated.bungie_membership_id,
+                preview_id,
+            )
+            preview_id = preview["preview_id"]
+            if not preview["confirmable"]:
+                blockers = preview["validation"].get("blockers", [])
+                detail = (
+                    str(blockers[0])
+                    if blockers
+                    else "The refreshed preview is not safe to confirm."
+                )
+                raise LoadoutPreviewError(
+                    "Live state was refreshed, but the updated safety "
+                    f"preview is blocked: {detail}"
+                )
+        if preview["action_plan"].get("automatic_backup") is False:
+            backup_choice = "skip"
         backup = None
         if backup_choice == "import":
             backup = await asyncio.to_thread(
@@ -254,8 +283,14 @@ async def loadout_operation_status(request: web.Request) -> web.Response:
             "total": operation["total_actions"],
             "progress_percent": operation["progress_percent"],
             "phase": current["phase"] if current else "Complete",
+            "action_number": (
+                int(current["action_index"]) + 1 if current else None
+            ),
             "attempts": current["attempts"] if current else 0,
-            "last_error": operation.get("last_error"),
+            "last_error": (
+                operation.get("last_error")
+                or (current or {}).get("last_message")
+            ),
         },
         headers={"Cache-Control": "no-store"},
     )
@@ -375,15 +410,24 @@ def render_confirmation(request: web.Request, preview: dict) -> str:
     if not preview["confirmable"]:
         return '<div class="notice error">This preview cannot be confirmed. Return to the source, refresh live data, and create a new preview.</div>'
     action = f"/loadout-previews/{preview['preview_id']}/confirm"
-    return f"""
-<section class="confirmation-card">
-  <div><p class="eyebrow">Live Destiny mutation</p><h2>Choose backup behavior, then confirm.</h2><p>This is the first control on this page that can write to Destiny. The operation is tied to this five-minute preview and exact target slots.</p></div>
-  <form method="post" action="{action}">
-    {csrf_input(request, action)}
+    if preview["action_plan"].get("automatic_backup") is False:
+        backup_control = """
+    <input type="hidden" name="backup_choice" value="skip">
+    <div class="notice warning">This set will be applied without creating a local backup. Empty board positions will clear their matching Destiny slots. Carried weapon and armor items not used by the set will be moved to the vault, and the highest occupied set position will remain equipped. A full vault may require moving vault items into spare inventory on another character.</div>"""
+        heading = "Confirm the exact 20-slot board."
+    else:
+        backup_control = """
     <fieldset><legend>Import current in-game slots as local backup?</legend>
       <label><input type="radio" name="backup_choice" value="import" required> Yes, import every populated slot first</label>
       <label><input type="radio" name="backup_choice" value="skip" required> No, continue without a local slot backup</label>
-    </fieldset>
+    </fieldset>"""
+        heading = "Choose backup behavior, then confirm."
+    return f"""
+<section class="confirmation-card">
+  <div><p class="eyebrow">Live Destiny mutation</p><h2>{heading}</h2><p>This is the first control on this page that can write to Destiny. The operation is tied to this five-minute preview and exact target slots.</p></div>
+  <form method="post" action="{action}">
+    {csrf_input(request, action)}
+    {backup_control}
     <label class="confirm-check"><input type="checkbox" name="confirmation" value="confirmed" required> I reviewed every replacement and clear action and authorize these exact live changes.</label>
     <button type="submit">Start confirmed synchronization</button>
   </form>

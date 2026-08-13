@@ -1,0 +1,370 @@
+"""Set-oriented loadout dashboard creation and board editing routes."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from html import escape
+from pathlib import Path
+from string import Template
+from urllib.parse import quote, urlencode
+
+from aiohttp import web
+
+from destiny_web_app.app_keys import (
+    AUTH_SESSION_KEY,
+    LOADOUT_FUNCTIONS_KEY,
+)
+from destiny_web_app.auth import csrf_input, require_csrf
+from destiny_web_app.inventory_routes import icon_url
+from destiny_web_app.loadout_freshness import ensure_fresh_loadout_snapshot
+from destiny_web_app.loadout_manager import CLASS_NAMES, LoadoutInspectionError
+from destiny_web_app.loadout_sets import LoadoutSetError
+from destiny_web_app.loadouts.inspection import inspect_in_game_loadouts
+from destiny_web_app.loadouts.library import list_cover_icons, list_loadouts
+from destiny_web_app.loadouts.sets import (
+    create_loadout_set,
+    create_loadout_set_from_character,
+    delete_loadout_set,
+    get_loadout_set,
+    rename_loadout_set,
+    save_loadout_set_board,
+)
+
+
+LOGGER = logging.getLogger(__name__)
+TEMPLATE_ROOT = Path(__file__).with_name("templates")
+
+
+async def create_loadout_page(request: web.Request) -> web.Response:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPSeeOther("/")
+    functions = request.app[LOADOUT_FUNCTIONS_KEY]
+    error = ""
+    try:
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
+        )
+        inspection, icons = await asyncio.gather(
+            asyncio.to_thread(
+                inspect_in_game_loadouts,
+                functions,
+                authenticated.bungie_membership_id,
+            ),
+            asyncio.to_thread(
+                list_cover_icons,
+                functions,
+                authenticated.bungie_membership_id,
+            ),
+        )
+    except Exception as exc:
+        LOGGER.exception("Could not prepare in-game loadout import")
+        inspection, icons = None, []
+        error = str(exc)
+    characters = inspection["characters"] if inspection else []
+    html = render_template(
+        "loadout_create.html",
+        guardian_name=escape(authenticated.display_name),
+        notices=notice(request.query.get("error", "") or error, "error"),
+        character_options="".join(
+            f'<option value="{escape(row["character_id"])}">'
+            f'{escape(row["class_name"])}</option>'
+            for row in characters
+        ),
+        slot_groups="".join(render_import_character(row) for row in characters),
+        icon_choices=render_icon_choices(icons),
+        csrf=csrf_input(request, "/loadouts/import-slot"),
+    )
+    return web.Response(
+        text=html, content_type="text/html", headers={"Cache-Control": "no-store"}
+    )
+
+
+async def create_set(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before creating a set.")
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        board = await asyncio.to_thread(
+            create_loadout_set,
+            request.app[LOADOUT_FUNCTIONS_KEY],
+            authenticated.bungie_membership_id,
+            name=str(form.get("name") or ""),
+            character_class=int(str(form.get("character_class") or "-1")),
+        )
+    except Exception as error:
+        raise web.HTTPSeeOther(
+            "/loadouts?" + urlencode({"error": str(error)})
+        )
+    raise web.HTTPSeeOther(f'/loadout-sets/{board["set_id"]}')
+
+
+async def create_set_from_character(
+    request: web.Request,
+) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before importing a set.")
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        await ensure_fresh_loadout_snapshot(
+            request, authenticated, force=True
+        )
+        board = await asyncio.to_thread(
+            create_loadout_set_from_character,
+            request.app[LOADOUT_FUNCTIONS_KEY],
+            authenticated.bungie_membership_id,
+            name=str(form.get("name") or ""),
+            character_id=str(form.get("character_id") or ""),
+        )
+    except Exception as error:
+        LOGGER.exception("Could not import a character's loadout set")
+        raise web.HTTPSeeOther(
+            "/loadouts?" + urlencode({"error": str(error)})
+        )
+    raise web.HTTPSeeOther(
+        f'/loadout-sets/{board["set_id"]}?'
+        + urlencode(
+            {
+                "notice": (
+                    f'Imported {board["filled_count"]} loadouts in their '
+                    "original positions."
+                )
+            }
+        )
+    )
+
+
+async def loadout_set_page(request: web.Request) -> web.Response:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPSeeOther("/")
+    functions = request.app[LOADOUT_FUNCTIONS_KEY]
+    try:
+        await ensure_fresh_loadout_snapshot(request, authenticated)
+        board, loadouts = await asyncio.gather(
+            asyncio.to_thread(
+                get_loadout_set,
+                functions,
+                authenticated.bungie_membership_id,
+                set_id=request.match_info["set_id"],
+            ),
+            asyncio.to_thread(
+                list_loadouts,
+                functions,
+                authenticated.bungie_membership_id,
+                include_archived=True,
+            ),
+        )
+    except Exception as error:
+        LOGGER.exception("Could not prepare the loadout set editor")
+        raise web.HTTPSeeOther(
+            "/loadouts?" + urlencode({"error": str(error)})
+        )
+    if board is None:
+        raise web.HTTPNotFound()
+    compatible = [
+        row
+        for row in loadouts
+        if int(row["character_class_type"])
+        == int(board["character_class_type"])
+    ]
+    html = render_template(
+        "loadout_set.html",
+        guardian_name=escape(authenticated.display_name),
+        set_name=escape(board["name"]),
+        class_name=escape(board["class_name"]),
+        notices=(
+            notice(request.query.get("notice", ""), "success")
+            + notice(request.query.get("error", ""), "error")
+        ),
+        board=render_editor_board(board),
+        tray="".join(render_tray_item(row) for row in compatible)
+        or '<p class="set-empty-copy">Create a loadout for this class first.</p>',
+        set_id=escape(board["set_id"]),
+        version=str(board["version"]),
+        save_csrf=csrf_input(request, "/loadout-sets/save"),
+        delete_csrf=csrf_input(request, "/loadout-sets/delete"),
+        rename_csrf=csrf_input(request, "/loadout-sets/rename"),
+        preview_csrf=csrf_input(request, "/loadout-sets/preview"),
+        preview_disabled=" disabled" if not board["filled_count"] else "",
+    )
+    return web.Response(
+        text=html, content_type="text/html", headers={"Cache-Control": "no-store"}
+    )
+
+
+async def save_set(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before saving a set.")
+    set_id = ""
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        set_id = str(form.get("set_id") or "")
+        slots = {
+            position: str(form.get(f"slot_{position}") or "")
+            for position in range(20)
+            if str(form.get(f"slot_{position}") or "")
+        }
+        await asyncio.to_thread(
+            save_loadout_set_board,
+            request.app[LOADOUT_FUNCTIONS_KEY],
+            authenticated.bungie_membership_id,
+            set_id=set_id,
+            slots=slots,
+            expected_version=int(str(form.get("version") or "0")),
+        )
+    except (LoadoutSetError, LookupError, ValueError) as error:
+        raise web.HTTPSeeOther(
+            f"/loadout-sets/{quote(set_id, safe='')}?"
+            + urlencode({"error": str(error)})
+        )
+    raise web.HTTPSeeOther(
+        f"/loadout-sets/{quote(set_id, safe='')}?"
+        + urlencode({"notice": "Set board saved."})
+    )
+
+
+async def rename_set(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before renaming a set.")
+    set_id = ""
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        set_id = str(form.get("set_id") or "")
+        await asyncio.to_thread(
+            rename_loadout_set,
+            request.app[LOADOUT_FUNCTIONS_KEY],
+            authenticated.bungie_membership_id,
+            set_id=set_id,
+            name=str(form.get("name") or ""),
+        )
+    except (LoadoutSetError, LookupError, ValueError) as error:
+        raise web.HTTPSeeOther(
+            f"/loadout-sets/{quote(set_id, safe='')}?"
+            + urlencode({"error": str(error)})
+        )
+    raise web.HTTPSeeOther(
+        f"/loadout-sets/{quote(set_id, safe='')}?"
+        + urlencode({"notice": "Set renamed."})
+    )
+
+
+async def delete_set(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before deleting a set.")
+    form = await request.post()
+    require_csrf(request, form)
+    set_id = str(form.get("set_id") or "")
+    await asyncio.to_thread(
+        delete_loadout_set,
+        request.app[LOADOUT_FUNCTIONS_KEY],
+        authenticated.bungie_membership_id,
+        set_id=set_id,
+    )
+    raise web.HTTPSeeOther(
+        "/loadouts?" + urlencode({"notice": "Loadout set permanently deleted."})
+    )
+
+
+def render_import_character(character: dict) -> str:
+    slots = "".join(render_import_slot(character, slot) for slot in character["slots"])
+    return (
+        f'<section class="import-slots" data-import-character="{escape(character["character_id"])}">'
+        f'<h2>{escape(character["class_name"])} loadouts</h2><div class="import-slot-grid">{slots}</div></section>'
+    )
+
+
+def render_import_slot(character: dict, slot: dict) -> str:
+    disabled = not slot["items"]
+    state = "Empty" if not slot["items"] else (
+        f'{slot["unresolved_count"]} missing · kept blank'
+        if slot["unresolved_count"] else f'{len(slot["items"])} items'
+    )
+    icon = image_or_fallback(slot.get("icon_path"), character["class_name"][:1])
+    return f"""
+<button type="button" class="import-slot" data-import-slot
+ data-character-id="{escape(character['character_id'])}"
+ data-slot-index="{slot['slot_index']}"
+ data-slot-name="{escape(slot['name'])}"
+ data-icon-hash="{slot['identifiers'].get('icon') or ''}"
+ {'disabled' if disabled else ''}>
+ {icon}<strong>Slot {slot['display_index']}</strong><span>{escape(state)}</span>
+</button>"""
+
+
+def render_icon_choices(icons: list[dict]) -> str:
+    return "".join(
+        f'<label class="icon-choice"><input type="radio" name="cover_icon_hash" '
+        f'value="{row["hash"]}" required><span>{image_or_fallback(row.get("icon_path"), "◇")}'
+        f'<span class="sr-only">{escape(row["name"])}</span></span></label>'
+        for row in icons
+    )
+
+
+def render_editor_board(board: dict) -> str:
+    slots = {int(row["position"]): row for row in board["slots"]}
+    return "".join(render_editor_cell(position, slots.get(position), board) for position in range(20))
+
+
+def render_editor_cell(position: int, row: dict | None, board: dict) -> str:
+    loadout = row.get("loadout") if row else None
+    loadout_id = loadout["loadout_id"] if loadout else ""
+    content = render_loadout_icon(loadout, position, board["set_id"]) if loadout else '<span class="empty-plus">+</span>'
+    clear = (
+        '<button type="button" class="cell-select" data-cell-select '
+        'aria-label="Select this position to move or swap">↔</button>'
+        '<button type="button" class="cell-clear" data-cell-clear '
+        'aria-label="Empty this position">×</button>'
+        if loadout else ""
+    )
+    return f"""
+<div class="set-cell {'occupied' if loadout else 'empty'}" data-set-cell data-position="{position}" tabindex="0" aria-label="Set position {position + 1}" draggable="{'true' if loadout else 'false'}">
+  <input type="hidden" name="slot_{position}" value="{escape(loadout_id)}" data-slot-value>
+  <span class="slot-number">{position + 1}</span>{content}{clear}
+</div>"""
+
+
+def render_tray_item(loadout: dict) -> str:
+    return f"""
+<button type="button" class="tray-loadout" draggable="true" data-tray-loadout
+ data-loadout-id="{escape(loadout['loadout_id'])}" data-loadout-name="{escape(loadout['name'])}"
+ data-icon-path="{escape(loadout.get('cover_icon_path') or '')}"
+ aria-label="Select {escape(loadout['name'])}">
+ {image_or_fallback(loadout.get('cover_icon_path'), loadout['class_name'][:1])}
+ <span>{escape(loadout['name'])}</span>
+</button>"""
+
+
+def render_loadout_icon(loadout: dict, position: int, set_id: str) -> str:
+    href = (
+        f'/loadouts/saved/{quote(loadout["loadout_id"], safe="")}'
+        f'?set_id={quote(set_id, safe="")}&position={position}'
+    )
+    return (
+        f'<a class="board-loadout-link" href="{escape(href, quote=True)}" title="{escape(loadout["name"])} · Slot {position + 1}" '
+        f'aria-label="Open {escape(loadout["name"])} in slot {position + 1}">'
+        f'{image_or_fallback(loadout.get("cover_icon_path"), loadout["class_name"][:1])}</a>'
+    )
+
+
+def image_or_fallback(path: str | None, fallback: str) -> str:
+    url = icon_url(path) if path else ""
+    return f'<img src="{escape(url)}" alt="">' if url else f'<span class="icon-fallback">{escape(fallback)}</span>'
+
+
+def notice(value: str, tone: str) -> str:
+    return f'<div class="notice {tone}">{escape(value)}</div>' if value else ""
+
+
+def render_template(name: str, **values: str) -> str:
+    return Template((TEMPLATE_ROOT / name).read_text(encoding="utf-8")).substitute(values)

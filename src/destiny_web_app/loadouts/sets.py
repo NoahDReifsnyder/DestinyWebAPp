@@ -1,4 +1,4 @@
-"""Build and edit ordered sets of pinned loadout revisions."""
+"""Create and edit class-bound 20-position loadout sets."""
 
 from __future__ import annotations
 
@@ -12,203 +12,93 @@ def create_loadout_set(
     user_id: str,
     *,
     name: str,
-    activity_name: str,
-    description: str = "",
-    game: str = "Destiny 2",
-    activity_version: str = "",
+    character_class: int,
 ) -> dict[str, Any]:
-    """Create an empty activity-oriented loadout set."""
-
     return functions.sets.create(
+        user_id, name=name, character_class_type=character_class
+    )
+
+
+def create_loadout_set_from_character(
+    functions: LoadoutFunctions,
+    user_id: str,
+    *,
+    name: str,
+    character_id: str,
+) -> dict[str, Any]:
+    """Import every populated in-game slot into its matching set position."""
+
+    return functions.sets.create_from_character(
         user_id,
         name=name,
-        description=description,
-        game=game,
-        activity_name=activity_name,
-        activity_version=activity_version,
+        character_id=character_id,
     )
 
 
 def list_loadout_sets(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    include_archived: bool = False,
+    functions: LoadoutFunctions, user_id: str
 ) -> list[dict[str, Any]]:
-    """List saved loadout sets."""
-
-    return functions.sets.plans(user_id, include_archived=include_archived)
+    return functions.sets.list(user_id)
 
 
 def get_loadout_set(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
+    functions: LoadoutFunctions, user_id: str, *, set_id: str
 ) -> dict[str, Any] | None:
-    """Return a set, encounter hierarchy, assignments, and editing options."""
-
-    return functions.sets.workspace(user_id, set_id)
+    return functions.sets.get(user_id, set_id)
 
 
-def update_loadout_set(
+def rename_loadout_set(
     functions: LoadoutFunctions,
     user_id: str,
     *,
     set_id: str,
     name: str,
-    activity_name: str,
-    description: str = "",
-    game: str = "Destiny 2",
-    activity_version: str = "",
-    note: str = "",
 ) -> dict[str, Any]:
-    """Append a metadata revision to a loadout set."""
+    return functions.sets.rename(user_id, set_id, name=name)
 
-    return functions.sets.update_metadata(
+
+def save_loadout_set_board(
+    functions: LoadoutFunctions,
+    user_id: str,
+    *,
+    set_id: str,
+    slots: Mapping[int, str],
+    expected_version: int,
+) -> dict[str, Any]:
+    return functions.sets.save_board(
         user_id,
         set_id,
-        name=name,
-        description=description,
-        game=game,
-        activity_name=activity_name,
-        activity_version=activity_version,
-        change_note=note,
+        slots=slots,
+        expected_version=expected_version,
     )
 
 
-def add_encounter(
+def list_loadout_set_usages(
+    functions: LoadoutFunctions,
+    user_id: str,
+    *,
+    loadout_id: str,
+) -> list[dict[str, Any]]:
+    return functions.sets.usages(user_id, loadout_id)
+
+
+def replace_loadout_in_set(
     functions: LoadoutFunctions,
     user_id: str,
     *,
     set_id: str,
-    order: int,
-    name: str,
-    notes: str = "",
-) -> dict[str, Any]:
-    """Append a set revision containing a new ordered encounter group."""
-
-    return functions.sets.add_encounter(
+    old_loadout_id: str,
+    new_loadout_id: str,
+) -> int:
+    return functions.sets.replace_all(
         user_id,
         set_id,
-        encounter_order=order,
-        name=name,
-        notes=notes,
+        old_loadout_id=old_loadout_id,
+        new_loadout_id=new_loadout_id,
     )
-
-
-def update_encounter(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
-    encounter_id: str,
-    order: int,
-    name: str,
-    notes: str = "",
-) -> dict[str, Any]:
-    """Append a set revision with one encounter changed."""
-
-    return functions.sets.update_encounter(
-        user_id,
-        set_id,
-        encounter_id,
-        encounter_order=order,
-        name=name,
-        notes=notes,
-    )
-
-
-def remove_encounter(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
-    encounter_id: str,
-) -> dict[str, Any]:
-    """Append a set revision without the selected encounter and assignments."""
-
-    return functions.sets.remove_encounter(user_id, set_id, encounter_id)
-
-
-def assign_loadout(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
-    encounter_id: str,
-    order: int,
-    loadout_revision_id: str,
-    character_id: str,
-    slot_index: int,
-    notes: str = "",
-) -> dict[str, Any]:
-    """Pin an immutable loadout revision to an exact zero-based game slot."""
-
-    return functions.sets.add_assignment(
-        user_id,
-        set_id,
-        encounter_id=encounter_id,
-        assignment_order=order,
-        loadout_revision_id=loadout_revision_id,
-        target_character_id=character_id,
-        target_slot_index=slot_index,
-        notes=notes,
-    )
-
-
-def unassign_loadout(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
-    assignment_id: str,
-) -> dict[str, Any]:
-    """Append a set revision without one slot assignment."""
-
-    return functions.sets.remove_assignment(user_id, set_id, assignment_id)
-
-
-def set_loadout_set_archived(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
-    archived: bool,
-) -> None:
-    """Archive or restore a set."""
-
-    functions.sets.set_archived(user_id, set_id, archived=archived)
 
 
 def delete_loadout_set(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
+    functions: LoadoutFunctions, user_id: str, *, set_id: str
 ) -> None:
-    """Delete a loadout set and its local immutable history."""
-
     functions.sets.delete(user_id, set_id)
-
-
-def export_loadout_set(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    set_id: str,
-) -> dict[str, Any]:
-    """Export a set together with every pinned loadout revision."""
-
-    return functions.sets.export_bundle(user_id, set_id)
-
-
-def import_loadout_set(
-    functions: LoadoutFunctions,
-    user_id: str,
-    *,
-    document: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Validate and import a set and all embedded exact loadouts."""
-
-    return functions.sets.import_bundle(user_id, dict(document))

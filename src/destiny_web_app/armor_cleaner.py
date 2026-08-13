@@ -11,7 +11,7 @@ from destiny_web_app.database import Database
 from destiny_web_app.manifest import ManifestService
 
 
-ARMOR_RULESET_VERSION = "armor-tier5-set-coverage-v1"
+ARMOR_RULESET_VERSION = "armor-tier5-set-coverage-v2"
 ARMOR_STAT_NAMES = (
     "Weapons",
     "Health",
@@ -446,24 +446,24 @@ def analyze_armor(
     for copies in duplicate_groups.values():
         ordered = sorted(
             copies,
-            key=lambda item: (
-                int(
-                    policy["tuning_mode"] == "preferred"
-                    and item["tuning_aligned"]
-                ),
-                int(item["masterworked"]),
-                -item["item_row_id"],
-            ),
+            key=lambda item: duplicate_preference_key(item, policy),
             reverse=True,
         )
         decisions[ordered[0]["item_row_id"]] = decision(
             "keep", "Representative of this intrinsic roll"
         )
         for duplicate in ordered[1:]:
+            alignment_note = (
+                " with tuning aligned to its intrinsic roll"
+                if ordered[0]["intrinsic_tuning_aligned"]
+                and not duplicate["intrinsic_tuning_aligned"]
+                else ""
+            )
             decisions[duplicate["item_row_id"]] = decision(
                 "candidate",
                 "Duplicate intrinsic roll; covered by "
-                f"{ordered[0]['name']} {ordered[0]['instance_suffix']}",
+                f"{ordered[0]['name']} {ordered[0]['instance_suffix']}"
+                f"{alignment_note}",
                 alternative_item_row_id=ordered[0]["item_row_id"],
             )
 
@@ -514,6 +514,22 @@ def analyze_armor(
         "policy": policy,
         "groups": groups,
     }
+
+
+def duplicate_preference_key(
+    item: dict[str, Any],
+    policy: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    """Rank copies of the same intrinsic roll for deterministic retention."""
+    return (
+        int(item["intrinsic_tuning_aligned"]),
+        int(
+            policy["tuning_mode"] == "preferred"
+            and item["tuning_aligned"]
+        ),
+        int(item["masterworked"]),
+        -item["item_row_id"],
+    )
 
 
 def apply_set_coverage(
@@ -640,6 +656,7 @@ def extract_armor_item(
         "intrinsic_stats": intrinsic,
         "archetype": archetype,
         "tuned_stat": tuned_stat,
+        "intrinsic_tuning_aligned": tuned_stat in intrinsic,
         "tuning_aligned": False,
         "stats": stats,
         "source_kind": item.get("source_kind"),

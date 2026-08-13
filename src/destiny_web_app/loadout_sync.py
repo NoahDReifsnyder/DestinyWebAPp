@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,8 @@ from destiny_web_app.bungie import (
     BungieError,
 )
 from destiny_web_app.database import as_iso, utc_now
-from destiny_web_app.inventory import InventoryService
+from destiny_web_app.database import GENERAL_VAULT_BUCKET_HASH
+from destiny_web_app.inventory import InventoryService, POSTMASTER_BUCKET_HASH
 from destiny_web_app.loadout_manager import (
     CLASS_NAMES,
     GAMEPLAY_BUCKET_NAMES,
@@ -48,6 +50,8 @@ TRANSFER_INTERVAL = 0.1
 EQUIP_INTERVAL = 0.1
 SOCKET_INTERVAL = 0.5
 LOADOUT_INTERVAL = 1.0
+# Bungie's bucket definition reports ten total slots: one equipped item plus
+# nine carried items.
 CHARACTER_BUCKET_CAPACITY = 9
 ARMOR_MOD_SOCKET_CATEGORY_HASH = 590099826
 SUBCLASS_BUCKET_HASH = 3284755031
@@ -55,10 +59,8 @@ SOCIAL_ACTIVITY_MODE_TYPE = 40
 # The current official manifest resolves this place as "Orbit". Keep the
 # manifest-name fallback below so a future orbit place hash can still work.
 KNOWN_ORBIT_PLACE_HASHES = {2961497387}
-# Monument of Triumph increased the live Destiny 2 vault to 1,300 slots.
-# Preview still uses the observed inventory count and blocks transient moves
-# when that currently published capacity would be exceeded.
-VAULT_CAPACITY = 1300
+FALLBACK_VAULT_CAPACITY = 1300
+LOGGER = logging.getLogger(__name__)
 
 
 class LoadoutPreviewError(ValueError):
@@ -125,6 +127,11 @@ class LoadoutSyncService:
             assignment=None,
         )
         blockers.extend(item_blockers)
+        blockers.extend(
+            self._aggregate_plan_capacity_blockers(
+                source, target_character_id, [slot_job]
+            )
+        )
         blockers.extend(self._activity_blockers(source, target_character_id))
         original = self._original_equipment(source, target_character_id)
         if original["issues"]:
@@ -281,6 +288,116 @@ class LoadoutSyncService:
             blockers=dedupe(blockers),
         )
 
+    def create_set_preview(
+        self,
+        owner: str,
+        *,
+        set_id: str,
+    ) -> dict[str, Any]:
+        """Preview a class-bound 20-position board using current loadout revisions."""
+
+        source = self._source(owner)
+        board = self.database.load_loadout_set(owner, set_id)
+        if board is None:
+            raise LoadoutPreviewError("The loadout set is unavailable.")
+        if not board["slots"]:
+            raise LoadoutPreviewError("An empty loadout set cannot be applied.")
+        class_type = int(board["character_class_type"])
+        characters = [
+            row
+            for row in source["characters"]
+            if int(row.get("class_type", -1)) == class_type
+        ]
+        if len(characters) != 1:
+            raise LoadoutPreviewError(
+                "The live profile must contain exactly one character of this set's class."
+            )
+        character = characters[0]
+        target_character_id = str(character["character_id"])
+        character, live_slots = self._target_character(
+            source, target_character_id, class_type
+        )
+        if len(live_slots) != 20:
+            raise LoadoutPreviewError(
+                f"This set requires 20 live slots, but {len(live_slots)} are available."
+            )
+        assigned = {int(row["position"]): row for row in board["slots"]}
+        blockers: list[str] = []
+        slot_jobs: list[dict[str, Any]] = []
+        for position in range(20):
+            slot_row = assigned.get(position)
+            if slot_row is None:
+                slot_jobs.append(
+                    {
+                        "kind": "clear",
+                        "slot_index": position,
+                        "display_index": position + 1,
+                        "encounter": None,
+                        "assignment": None,
+                        "current_slot": summarize_slot(live_slots[position]),
+                        "label": f"Clear empty board position {position + 1}",
+                        "write_request_count": (
+                            0 if slot_empty(live_slots[position]) else 1
+                        ),
+                    }
+                )
+                continue
+            loadout = self.loadouts.saved_loadout(
+                owner,
+                str(slot_row["loadout_id"]),
+                include_archived=True,
+            )
+            if loadout is None:
+                blockers.append(
+                    f"The loadout in position {position + 1} is unavailable."
+                )
+                continue
+            job, job_blockers = self._replacement_job(
+                source,
+                character,
+                loadout,
+                position,
+                current_slot=live_slots[position],
+                encounter=None,
+                assignment=None,
+            )
+            slot_jobs.append(job)
+            blockers.extend(job_blockers)
+        blockers.extend(
+            self._aggregate_plan_capacity_blockers(
+                source,
+                target_character_id,
+                slot_jobs,
+                retain_only_desired=True,
+            )
+        )
+        blockers.extend(self._activity_blockers(source, target_character_id))
+        original = self._original_equipment(source, target_character_id)
+        action_plan = self._finalize_action_plan(
+            source,
+            character,
+            slot_jobs,
+            original,
+            title=str(board["name"]),
+            activity_name=None,
+        )
+        action_plan["set_version"] = int(board["version"])
+        action_plan["clears_empty_positions"] = True
+        action_plan["automatic_backup"] = False
+        return self._persist_preview(
+            owner,
+            # Reuse the durable multi-slot operation category so historical
+            # operation evidence and its schema remain compatible.
+            preview_type="activity_plan",
+            source_entity_id=set_id,
+            source_revision_id=str(board["version"]),
+            target_character_id=target_character_id,
+            target_slot_index=None,
+            source=source,
+            action_plan=action_plan,
+            blockers=dedupe(blockers),
+        )
+
     def preview(self, owner: str, preview_id: str) -> dict[str, Any] | None:
         with self.database.connection() as connection:
             row = connection.execute(
@@ -333,14 +450,25 @@ class LoadoutSyncService:
                     (owner, preview["source_entity_id"]),
                 ).fetchone()
             else:
-                current = connection.execute(
+                board = connection.execute(
                     """
-                    SELECT current_revision_id FROM loadout_plans
-                    WHERE bungie_membership_id = ? AND plan_id = ?
-                      AND archived_at IS NULL
+                    SELECT CAST(version AS TEXT) AS current_revision_id
+                    FROM loadout_sets
+                    WHERE bungie_membership_id = ? AND set_id = ?
                     """,
                     (owner, preview["source_entity_id"]),
                 ).fetchone()
+                if board is not None:
+                    current = board
+                else:
+                    current = connection.execute(
+                        """
+                        SELECT current_revision_id FROM loadout_plans
+                        WHERE bungie_membership_id = ? AND plan_id = ?
+                          AND archived_at IS NULL
+                        """,
+                        (owner, preview["source_entity_id"]),
+                    ).fetchone()
         if current is None or current["current_revision_id"] != preview[
             "source_revision_id"
         ]:
@@ -349,6 +477,52 @@ class LoadoutSyncService:
                 "The saved source changed after preview. Create a new preview."
             )
         return preview
+
+    def rebuild_preview(
+        self, owner: str, preview_id: str
+    ) -> dict[str, Any]:
+        """Recreate stale preview evidence from the current saved source."""
+
+        previous = self.preview(owner, preview_id)
+        if previous is None:
+            raise LoadoutPreviewError("The preview is unavailable.")
+        if previous["status"] == "confirmed":
+            raise LoadoutPreviewError(
+                "This preview has already started an operation."
+            )
+        if previous["status"] in {"ready", "blocked"}:
+            self._set_preview_status(owner, preview_id, "invalidated")
+        if previous["preview_type"] == "single_slot":
+            loadout = self.loadouts.saved_loadout(
+                owner,
+                previous["source_entity_id"],
+                include_archived=True,
+            )
+            if loadout is None:
+                raise LoadoutPreviewError(
+                    "The loadout used by this preview is unavailable."
+                )
+            target_slot_index = previous.get("target_slot_index")
+            if target_slot_index is None:
+                raise LoadoutPreviewError(
+                    "The preview no longer identifies a target slot."
+                )
+            return self.create_single_preview(
+                owner,
+                loadout_id=previous["source_entity_id"],
+                revision_id=loadout["revision_id"],
+                target_character_id=previous["target_character_id"],
+                target_slot_index=int(target_slot_index),
+            )
+        if previous["action_plan"].get("set_version") is not None:
+            return self.create_set_preview(
+                owner,
+                set_id=previous["source_entity_id"],
+            )
+        return self.create_plan_preview(
+            owner,
+            plan_id=previous["source_entity_id"],
+        )
 
     def create_operation(
         self,
@@ -368,6 +542,29 @@ class LoadoutSyncService:
         try:
             with self.database.connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                # Explicitly confirming a newly generated preview supersedes
+                # any interrupted plan for the same character. Preserve its
+                # evidence as failed, but do not force the user to resume an
+                # obsolete action list before the current plan can start.
+                connection.execute(
+                    """
+                    UPDATE loadout_sync_operations
+                    SET status = 'failed',
+                        last_error = (
+                            'Superseded by a newly confirmed live preview.'
+                        ),
+                        updated_at = ?, completed_at = ?
+                    WHERE bungie_membership_id = ?
+                      AND target_character_id = ?
+                      AND status = 'paused'
+                    """,
+                    (
+                        now,
+                        now,
+                        owner,
+                        preview["target_character_id"],
+                    ),
+                )
                 connection.execute(
                     """
                     INSERT INTO loadout_sync_operations (
@@ -583,7 +780,72 @@ class LoadoutSyncService:
             self._run(owner, operation_id, access_token, lock)
         )
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(
+            lambda completed: self._operation_task_finished(
+                owner, operation_id, completed
+            )
+        )
+
+    def _operation_task_finished(
+        self,
+        owner: str,
+        operation_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            self._pause_interrupted_operation(
+                owner,
+                operation_id,
+                "The operation worker stopped before its current action "
+                "completed.",
+            )
+            return
+        error = task.exception()
+        if error is None:
+            return
+        LOGGER.error(
+            "Loadout operation worker stopped unexpectedly",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        self._pause_interrupted_operation(
+            owner,
+            operation_id,
+            "The operation worker stopped unexpectedly. Its durable "
+            "checkpoint can be resumed safely.",
+        )
+
+    def _pause_interrupted_operation(
+        self, owner: str, operation_id: str, reason: str
+    ) -> None:
+        now = as_iso(utc_now())
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE loadout_sync_action_attempts
+                SET status = 'failed', message = ?, completed_at = ?
+                WHERE operation_id = ? AND status = 'running'
+                """,
+                (reason, now, operation_id),
+            )
+            connection.execute(
+                """
+                UPDATE loadout_sync_actions
+                SET status = 'pending'
+                WHERE operation_id = ? AND status = 'running'
+                """,
+                (operation_id,),
+            )
+            connection.execute(
+                """
+                UPDATE loadout_sync_operations
+                SET status = 'paused', updated_at = ?, last_error = ?
+                WHERE bungie_membership_id = ? AND operation_id = ?
+                  AND status = 'running'
+                """,
+                (now, reason, owner, operation_id),
+            )
 
     def _validate_operation_source(
         self,
@@ -603,12 +865,21 @@ class LoadoutSyncService:
             else:
                 row = connection.execute(
                     """
-                    SELECT current_revision_id FROM loadout_plans
-                    WHERE bungie_membership_id = ? AND plan_id = ?
-                      AND archived_at IS NULL
+                    SELECT CAST(version AS TEXT) AS current_revision_id
+                    FROM loadout_sets
+                    WHERE bungie_membership_id = ? AND set_id = ?
                     """,
                     (owner, operation["source_entity_id"]),
                 ).fetchone()
+                if row is None:
+                    row = connection.execute(
+                        """
+                        SELECT current_revision_id FROM loadout_plans
+                        WHERE bungie_membership_id = ? AND plan_id = ?
+                          AND archived_at IS NULL
+                        """,
+                        (owner, operation["source_entity_id"]),
+                    ).fetchone()
         if row is None or row["current_revision_id"] != operation[
             "source_revision_id"
         ]:
@@ -707,6 +978,16 @@ class LoadoutSyncService:
             attempt_number = self._start_action_attempt(
                 operation["operation_id"], action["action_index"]
             )
+            item_id = str(action.get("item_instance_id") or "")
+            LOGGER.info(
+                "Operation %s checkpoint %s/%s starting attempt %s: %s%s",
+                operation["operation_id"],
+                int(action["action_index"]) + 1,
+                len(operation["actions"]),
+                attempt_number,
+                action["phase"],
+                f" (item …{item_id[-8:]})" if item_id else "",
+            )
             try:
                 evidence = await self._perform_action(
                     owner,
@@ -728,6 +1009,18 @@ class LoadoutSyncService:
                     attempt_number,
                     error,
                 )
+                LOGGER.warning(
+                    "Operation %s checkpoint %s attempt %s failed: %s",
+                    operation["operation_id"],
+                    int(action["action_index"]) + 1,
+                    attempt_number,
+                    error,
+                )
+                if isinstance(error, BungieActionError) and not error.transient:
+                    # Bungie has already told us this request cannot succeed in
+                    # the current state. Repeating the identical write only
+                    # delays useful failure evidence and can never repair it.
+                    break
                 if cycle_attempt + 1 >= MAX_ACTION_ATTEMPTS:
                     break
                 throttle = (
@@ -742,6 +1035,13 @@ class LoadoutSyncService:
                     action["action_index"],
                     attempt_number,
                     evidence,
+                )
+                LOGGER.info(
+                    "Operation %s checkpoint %s completed on attempt %s: %s",
+                    operation["operation_id"],
+                    int(action["action_index"]) + 1,
+                    attempt_number,
+                    evidence.get("message") or "verified",
                 )
                 return
         assert last_error is not None
@@ -768,7 +1068,7 @@ class LoadoutSyncService:
                 minted_after,
             )
             if minted_after is not None
-            else await self._fresh_source(owner, access_token)
+            else await self._available_source(owner, access_token)
         )
         membership_type = int(source["snapshot"]["membership_type"])
         if enforce_initial_state and state_fingerprint(source) != operation["action_plan"][
@@ -784,7 +1084,14 @@ class LoadoutSyncService:
                 raise LoadoutOperationError("The exact transfer item is missing.")
             terminal_character = request["target_character_id"]
             if action_type == "transfer_to_vault":
-                if item["source_kind"] == "vault" or (
+                vault_terminal = request.get("mode") in {
+                    "capacity_stage",
+                    "restore_vault_origin",
+                    "retain_set_only",
+                }
+                if item["source_kind"] == "vault":
+                    return {"message": "Transfer already reached the vault."}
+                if not vault_terminal and (
                     item.get("character_id") == terminal_character
                     and item["source_kind"] in {"character_inventory", "equipped"}
                 ):
@@ -838,6 +1145,16 @@ class LoadoutSyncService:
             return result
 
         if action_type == "insert_socket_plug":
+            changes = request.get("changes")
+            if isinstance(changes, list):
+                return await self._apply_socket_wave(
+                    owner,
+                    access_token,
+                    source,
+                    character_id,
+                    membership_type,
+                    changes,
+                )
             item = item_by_instance(source, action["item_instance_id"])
             if item is None:
                 raise LoadoutOperationError(
@@ -888,6 +1205,37 @@ class LoadoutSyncService:
             return result
 
         if action_type == "verify_socket_plug":
+            changes = expected.get("changes")
+            if isinstance(changes, list):
+                for change in changes:
+                    item = item_by_instance(
+                        source, str(change["item_instance_id"])
+                    )
+                    if item is None:
+                        raise LoadoutOperationError(
+                            "A socketed item disappeared during verification."
+                        )
+                    socket_index = int(change["socket_index"])
+                    current_plugs = component_plug_hashes(
+                        item.get("components")
+                    )
+                    current = (
+                        current_plugs[socket_index]
+                        if socket_index < len(current_plugs)
+                        else None
+                    )
+                    if current != int(change["plug_hash"]):
+                        raise LoadoutOperationError(
+                            f"{change['item_name']} socket "
+                            f"{socket_index + 1} did not verify after the "
+                            "free plug actions."
+                        )
+                return {
+                    "message": (
+                        f"Verified {len(changes)} free gameplay plug "
+                        "insertion(s)."
+                    )
+                }
             item = item_by_instance(source, action["item_instance_id"])
             if item is None:
                 raise LoadoutOperationError(
@@ -906,6 +1254,21 @@ class LoadoutSyncService:
                     "not verify after the free plug action."
                 )
             return {"message": "Free gameplay plug insertion verified."}
+
+        if (
+            action_type == "equip"
+            and request.get("mode") == "parallel_prepare"
+        ):
+            return await self._prepare_loadout_wave(
+                owner,
+                access_token,
+                source,
+                character_id,
+                membership_type,
+                expected["items"],
+                request.get("socket_clears", []),
+                request.get("socket_changes", []),
+            )
 
         if (
             action_type == "equip"
@@ -930,7 +1293,7 @@ class LoadoutSyncService:
                     )
                 }
             item_ids = [str(item["item_instance_id"]) for item in replacements]
-            results: list[dict[str, Any]] = []
+            requests = []
             for item_id in item_ids:
                 item = item_by_instance(source, item_id)
                 if (
@@ -943,20 +1306,25 @@ class LoadoutSyncService:
                         "Every Exotic-slot replacement must verify on the "
                         "target character before equip."
                     )
-                # Equip each replacement independently. Bungie's bulk endpoint
-                # can return an envelope-level success while reporting a
-                # different result for each item, and simultaneous weapon plus
-                # armor Exotic displacement has proven unreliable in practice.
-                result = await self.bungie.equip_items(
-                    access_token,
-                    item_instance_ids=[item_id],
-                    character_id=character_id,
-                    membership_type=membership_type,
+                # Weapon and armor replacements are independent. Send them at
+                # the same time, while keeping each request independently
+                # observable because Bungie's bulk response can contain
+                # per-item failures.
+                requests.append(
+                    self.bungie.equip_items(
+                        access_token,
+                        item_instance_ids=[item_id],
+                        character_id=character_id,
+                        membership_type=membership_type,
+                    )
                 )
-                results.append(result)
-                await asyncio.sleep(
-                    max(EQUIP_INTERVAL, result["throttle_seconds"])
+            results = await asyncio.gather(*requests)
+            await asyncio.sleep(
+                max(
+                    EQUIP_INTERVAL,
+                    *(result["throttle_seconds"] for result in results),
                 )
+            )
             evidence = dict(results[-1])
             evidence["message"] = (
                 "Bungie accepted and individually validated Exotic-slot "
@@ -1026,13 +1394,20 @@ class LoadoutSyncService:
 
         if action_type == "snapshot":
             slot = character_slot(source, character_id, action["target_slot_index"])
-            if slot_matches(slot, expected["items"]):
+            if slot_matches(
+                slot,
+                expected["items"],
+                allow_extra=bool(expected.get("partial")),
+            ):
                 return {"message": "Target slot already matches; snapshot skipped."}
             result = await self.bungie.snapshot_loadout(
                 access_token,
                 loadout_index=int(action["target_slot_index"]),
                 character_id=character_id,
                 membership_type=membership_type,
+                color_hash=valid_hash(request.get("color_hash")),
+                icon_hash=valid_hash(request.get("icon_hash")),
+                name_hash=valid_hash(request.get("name_hash")),
             )
             await asyncio.sleep(max(LOADOUT_INTERVAL, result["throttle_seconds"]))
             return result
@@ -1055,7 +1430,11 @@ class LoadoutSyncService:
 
         if action_type == "verify_slot":
             slot = character_slot(source, character_id, action["target_slot_index"])
-            if not slot_matches(slot, expected["items"]):
+            if not slot_matches(
+                slot,
+                expected["items"],
+                allow_extra=bool(expected.get("partial")),
+            ):
                 raise LoadoutOperationError(
                     f"Slot {int(action['target_slot_index']) + 1} did not match the pinned revision."
                 )
@@ -1103,6 +1482,368 @@ class LoadoutSyncService:
                 raise LoadoutOperationError("Original equipment did not fully restore.")
             return {"message": "Original equipment restored and verified."}
         raise LoadoutOperationError(f"Unsupported operation action {action_type}.")
+
+    async def _apply_socket_wave(
+        self,
+        owner: str,
+        access_token: str,
+        source: dict[str, Any],
+        character_id: str,
+        membership_type: int,
+        changes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply independent socket writes in parallel retry waves."""
+
+        pending = list(changes)
+        latest_source = source
+        last_errors: dict[tuple[str, int], Exception] = {}
+        for wave_index in range(MAX_ACTION_ATTEMPTS):
+            pending = self._pending_socket_changes(latest_source, pending)
+            if not pending:
+                return {
+                    "message": (
+                        f"Verified {len(changes)} parallel socket write(s)."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": 0,
+                }
+
+            LOGGER.info(
+                "Parallel socket wave %s/%s is applying %s unresolved "
+                "write(s)",
+                wave_index + 1,
+                MAX_ACTION_ATTEMPTS,
+                len(pending),
+            )
+            coroutines = []
+            submitted: list[dict[str, Any]] = []
+            for change in pending:
+                item = item_by_instance(
+                    latest_source, str(change["item_instance_id"])
+                )
+                if item is None:
+                    raise LoadoutOperationError(
+                        "An item required by the socket wave is missing."
+                    )
+                if (
+                    item.get("character_id") != character_id
+                    or item.get("source_kind")
+                    not in {"character_inventory", "equipped"}
+                ):
+                    raise LoadoutOperationError(
+                        "A socket-wave item is not on the target character."
+                    )
+                if self._free_socket_change(
+                    latest_source,
+                    item,
+                    character_id,
+                    socket_index=int(change["socket_index"]),
+                    plug_hash=int(change["plug_hash"]),
+                    item_name=str(change["item_name"]),
+                ) is None:
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} socket "
+                        f"{int(change['socket_index']) + 1} is no longer "
+                        "reported as freely insertable."
+                    )
+                submitted.append(change)
+                coroutines.append(
+                    self.bungie.insert_socket_plug_free(
+                        access_token,
+                        item_instance_id=str(change["item_instance_id"]),
+                        socket_index=int(change["socket_index"]),
+                        plug_hash=int(change["plug_hash"]),
+                        character_id=character_id,
+                        membership_type=membership_type,
+                    )
+                )
+            results = await asyncio.gather(
+                *coroutines, return_exceptions=True
+            )
+            throttle = 0.0
+            for change, result in zip(submitted, results, strict=True):
+                key = (
+                    str(change["item_instance_id"]),
+                    int(change["socket_index"]),
+                )
+                if isinstance(result, Exception):
+                    if isinstance(result, BungieAuthenticationRejected):
+                        raise result
+                    last_errors[key] = result
+                else:
+                    last_errors.pop(key, None)
+                    throttle = max(
+                        throttle, float(result["throttle_seconds"])
+                    )
+            await asyncio.sleep(max(SOCKET_INTERVAL, throttle))
+            latest_source = await self._fresh_source(owner, access_token)
+            pending = self._pending_socket_changes(latest_source, pending)
+            LOGGER.info(
+                "Parallel socket wave %s verified; %s write(s) remain",
+                wave_index + 1,
+                len(pending),
+            )
+            if not pending:
+                return {
+                    "message": (
+                        f"Verified {len(changes)} parallel socket write(s)."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": 0,
+                }
+            if wave_index + 1 < MAX_ACTION_ATTEMPTS:
+                await asyncio.sleep(RETRY_DELAYS[wave_index])
+
+        failed = []
+        for change in pending:
+            key = (
+                str(change["item_instance_id"]),
+                int(change["socket_index"]),
+            )
+            detail = last_errors.get(key)
+            failed.append(
+                f"{change['item_name']} socket "
+                f"{int(change['socket_index']) + 1}"
+                + (f" ({detail})" if detail is not None else "")
+            )
+        raise BungieActionError(
+            "Socket writes did not verify after parallel retries: "
+            + "; ".join(failed),
+            error_status="SocketWaveDidNotVerify",
+            transient=False,
+        )
+
+    @staticmethod
+    def _pending_socket_changes(
+        source: dict[str, Any], changes: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        pending = []
+        for change in changes:
+            item = item_by_instance(
+                source, str(change["item_instance_id"])
+            )
+            socket_index = int(change["socket_index"])
+            plugs = component_plug_hashes(
+                item.get("components") if item is not None else None
+            )
+            if (
+                socket_index >= len(plugs)
+                or plugs[socket_index] != int(change["plug_hash"])
+            ):
+                pending.append(change)
+        return pending
+
+    async def _prepare_loadout_wave(
+        self,
+        owner: str,
+        access_token: str,
+        source: dict[str, Any],
+        character_id: str,
+        membership_type: int,
+        expected_items: list[dict[str, Any]],
+        socket_clears: list[dict[str, Any]],
+        socket_changes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Converge equipment and sockets using maximum independent writes."""
+
+        latest_source = source
+        item_ids = [str(item["item_instance_id"]) for item in expected_items]
+        last_errors: list[str] = []
+        for wave_index in range(MAX_ACTION_ATTEMPTS):
+            equipment_pending = not equipment_matches(
+                latest_source,
+                character_id,
+                expected_items,
+                compare_plugs=False,
+            )
+            socket_pending = self._pending_socket_changes(
+                latest_source, socket_changes
+            )
+            if not equipment_pending and not socket_pending:
+                return {
+                    "message": (
+                        "Exact equipment and all saved sockets verified after "
+                        f"{wave_index} parallel wave(s)."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": 0,
+                }
+
+            coroutines = []
+            labels: list[str] = []
+
+            def queue_socket(change: dict[str, Any], label: str) -> None:
+                item = item_by_instance(
+                    latest_source, str(change["item_instance_id"])
+                )
+                if item is None:
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} disappeared while preparing "
+                        "the loadout."
+                    )
+                if (
+                    item.get("character_id") != character_id
+                    or item.get("source_kind")
+                    not in {"character_inventory", "equipped"}
+                ):
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} is not on the target character."
+                    )
+                if self._free_socket_change(
+                    latest_source,
+                    item,
+                    character_id,
+                    socket_index=int(change["socket_index"]),
+                    plug_hash=int(change["plug_hash"]),
+                    item_name=str(change["item_name"]),
+                ) is None:
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} socket "
+                        f"{int(change['socket_index']) + 1} is no longer "
+                        "reported as freely insertable."
+                    )
+                labels.append(label)
+                coroutines.append(
+                    self.bungie.insert_socket_plug_free(
+                        access_token,
+                        item_instance_id=str(change["item_instance_id"]),
+                        socket_index=int(change["socket_index"]),
+                        plug_hash=int(change["plug_hash"]),
+                        character_id=character_id,
+                        membership_type=membership_type,
+                    )
+                )
+
+            # Empty plugs are preparatory rather than a final target. Submit
+            # them only in the first wave, alongside the desired plugs. If a
+            # same-socket race leaves the empty plug last, final-state
+            # verification resubmits only the desired plug in the next wave.
+            if wave_index == 0:
+                pending_keys = {
+                    (
+                        str(change["item_instance_id"]),
+                        int(change["socket_index"]),
+                    )
+                    for change in socket_pending
+                }
+                for change in socket_clears:
+                    key = (
+                        str(change["item_instance_id"]),
+                        int(change["socket_index"]),
+                    )
+                    if key in pending_keys:
+                        queue_socket(change, f"clear {key[0]}:{key[1]}")
+            for change in socket_pending:
+                queue_socket(
+                    change,
+                    "socket "
+                    f"{change['item_instance_id']}:{change['socket_index']}",
+                )
+
+            if equipment_pending:
+                for item_id in item_ids:
+                    item = item_by_instance(latest_source, item_id)
+                    if (
+                        item is None
+                        or item.get("character_id") != character_id
+                        or item.get("source_kind")
+                        not in {"character_inventory", "equipped"}
+                    ):
+                        raise LoadoutOperationError(
+                            "Every exact item must be on the target character "
+                            "before parallel preparation."
+                        )
+                for replacement in self._exotic_replacements(
+                    latest_source, character_id, expected_items
+                ):
+                    replacement_id = str(replacement["item_instance_id"])
+                    labels.append(f"exotic replacement {replacement_id}")
+                    coroutines.append(
+                        self.bungie.equip_items(
+                            access_token,
+                            item_instance_ids=[replacement_id],
+                            character_id=character_id,
+                            membership_type=membership_type,
+                        )
+                    )
+                labels.append("bulk exact equip")
+                coroutines.append(
+                    self.bungie.equip_items(
+                        access_token,
+                        item_instance_ids=item_ids,
+                        character_id=character_id,
+                        membership_type=membership_type,
+                    )
+                )
+
+            LOGGER.info(
+                "Parallel preparation wave %s/%s submitted %s write(s): "
+                "%s socket target(s), equipment=%s",
+                wave_index + 1,
+                MAX_ACTION_ATTEMPTS,
+                len(coroutines),
+                len(socket_pending),
+                equipment_pending,
+            )
+            results = await asyncio.gather(
+                *coroutines, return_exceptions=True
+            )
+            last_errors = []
+            throttle = 0.0
+            for label, result in zip(labels, results, strict=True):
+                if isinstance(result, BungieAuthenticationRejected):
+                    raise result
+                if isinstance(result, Exception):
+                    last_errors.append(f"{label}: {result}")
+                else:
+                    throttle = max(
+                        throttle, float(result["throttle_seconds"])
+                    )
+            await asyncio.sleep(max(EQUIP_INTERVAL, SOCKET_INTERVAL, throttle))
+            latest_source = await self._fresh_source(owner, access_token)
+            remaining_sockets = self._pending_socket_changes(
+                latest_source, socket_changes
+            )
+            remaining_equipment = not equipment_matches(
+                latest_source,
+                character_id,
+                expected_items,
+                compare_plugs=False,
+            )
+            LOGGER.info(
+                "Parallel preparation wave %s verified; %s socket target(s) "
+                "remain, equipment=%s",
+                wave_index + 1,
+                len(remaining_sockets),
+                "pending" if remaining_equipment else "verified",
+            )
+            if not remaining_equipment and not remaining_sockets:
+                return {
+                    "message": (
+                        "Exact equipment and all saved sockets verified after "
+                        f"{wave_index + 1} parallel wave(s)."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": throttle,
+                }
+            if wave_index + 1 < MAX_ACTION_ATTEMPTS:
+                await asyncio.sleep(RETRY_DELAYS[wave_index])
+
+        detail = "; ".join(last_errors)
+        raise BungieActionError(
+            "Parallel loadout preparation did not converge after retries."
+            + (f" Last request errors: {detail}" if detail else ""),
+            error_status="ParallelPreparationDidNotVerify",
+            transient=False,
+        )
 
     def _exotic_replacements(
         self,
@@ -1225,6 +1966,11 @@ class LoadoutSyncService:
             # Bungie's live plug-set response is the authoritative evidence
             # that the exact saved plug is unlocked and insertable.
             socket_kind = "subclass plug"
+        elif bucket_hash == REQUIRED_GAMEPLAY_BUCKET_ORDER[-1]:
+            # Seasonal artifact perks are represented by normal artifact
+            # sockets. Bungie's live plug-set response remains authoritative
+            # for whether a saved perk is unlocked and freely insertable.
+            socket_kind = "artifact perk"
         else:
             return None
         if not plug_is_live_insertable(
@@ -1262,6 +2008,18 @@ class LoadoutSyncService:
             bungie_membership_id=owner,
             access_token=access_token,
             force=True,
+        )
+        return self._source(owner)
+
+    async def _available_source(
+        self, owner: str, access_token: str
+    ) -> dict[str, Any]:
+        """Reuse verified fresh evidence; fetch only when it has gone stale."""
+
+        await self.inventory.synchronize(
+            bungie_membership_id=owner,
+            access_token=access_token,
+            force=False,
         )
         return self._source(owner)
 
@@ -1364,11 +2122,12 @@ class LoadoutSyncService:
         )
         classifications = []
         transfers = []
+        socket_clears = []
         socket_changes = []
         expected_items = []
+        partial = bool(loadout.get("partial"))
         weapon_exotics = 0
         armor_exotics = 0
-        incoming_by_bucket: dict[int, int] = {}
         for saved_item in loadout["items"]:
             instance_id = str(saved_item["item_instance_id"])
             item = active.get(instance_id)
@@ -1389,6 +2148,7 @@ class LoadoutSyncService:
                 live_bucket = None
             if live_bucket != bucket_hash:
                 blockers.append(f"{saved_item['name']} no longer resolves to its saved slot.")
+            location = classify_location(item, target_character_id)
             instance_component = item.get("components", {}).get("instances", {})
             if (definition or {}).get("equippable") is False:
                 blockers.append(
@@ -1408,7 +2168,9 @@ class LoadoutSyncService:
                 # equipped. The complete item set is equipped together and
                 # verified afterward, so this transient state is not a hard
                 # preview blocker. All other failure reasons remain blocked.
-                if cannot_reason != 2:
+                if not equip_failure_is_transient(
+                    cannot_reason, location=location
+                ):
                     blockers.append(
                         f"{saved_item['name']} cannot currently be equipped."
                     )
@@ -1454,8 +2216,46 @@ class LoadoutSyncService:
                             "gameplay plug."
                         )
                     else:
+                        # Armor mod energy is enforced on every individual
+                        # insertion. Clear each changed socket before adding
+                        # any saved mods so an old + new transient combination
+                        # cannot exceed the item's energy capacity.
+                        if (
+                            socket_change["category_hash"]
+                            == ARMOR_MOD_SOCKET_CATEGORY_HASH
+                        ):
+                            socket_data = (definition or {}).get("sockets")
+                            socket_entries = (
+                                socket_data.get("socketEntries", [])
+                                if isinstance(socket_data, dict)
+                                else []
+                            )
+                            socket_entry = (
+                                socket_entries[index]
+                                if isinstance(socket_entries, list)
+                                and index < len(socket_entries)
+                                and isinstance(socket_entries[index], dict)
+                                else {}
+                            )
+                            empty_hash = valid_hash(
+                                socket_entry.get("singleInitialItemHash")
+                            )
+                            if (
+                                empty_hash is not None
+                                and empty_hash != int(plug["plug_hash"])
+                                and current != empty_hash
+                            ):
+                                clear_change = self._free_socket_change(
+                                    source,
+                                    item,
+                                    target_character_id,
+                                    socket_index=index,
+                                    plug_hash=empty_hash,
+                                    item_name=saved_item["name"],
+                                )
+                                if clear_change is not None:
+                                    socket_clears.append(clear_change)
                         socket_changes.append(socket_change)
-            location = classify_location(item, target_character_id)
             classifications.append(
                 {
                     "name": saved_item["name"],
@@ -1474,7 +2274,6 @@ class LoadoutSyncService:
                         "target_character_id": target_character_id,
                     }
                 )
-                incoming_by_bucket[bucket_hash] = incoming_by_bucket.get(bucket_hash, 0) + 1
             elif location == "another_character":
                 if item["source_kind"] == "equipped":
                     blockers.append(
@@ -1500,7 +2299,6 @@ class LoadoutSyncService:
                             },
                         ]
                     )
-                    incoming_by_bucket[bucket_hash] = incoming_by_bucket.get(bucket_hash, 0) + 1
             elif location in {"postmaster", "shared_inventory", "non_transferable"}:
                 blockers.append(
                     f"{saved_item['name']} is at unsupported location {location.replace('_', ' ')}."
@@ -1518,33 +2316,18 @@ class LoadoutSyncService:
             blockers.append("The pinned revision contains multiple Exotic weapons.")
         if armor_exotics > 1:
             blockers.append("The pinned revision contains multiple Exotic armor pieces.")
-        if len(expected_items) != len(REQUIRED_GAMEPLAY_BUCKETS):
+        if (
+            len(expected_items) != len(REQUIRED_GAMEPLAY_BUCKETS)
+            and not partial
+        ):
             blockers.append("The pinned revision is incomplete.")
-        carried_by_bucket: dict[int, int] = {}
-        for item in source["items"]:
-            if item["source_kind"] != "character_inventory" or item.get("character_id") != target_character_id:
-                continue
-            definition = item_defs.get(int(item["item_hash"]))
-            try:
-                bucket = intended_bucket_hash(definition)
-            except LoadoutInspectionError:
-                continue
-            carried_by_bucket[bucket] = carried_by_bucket.get(bucket, 0) + 1
-        for bucket, incoming in incoming_by_bucket.items():
-            remaining = CHARACTER_BUCKET_CAPACITY - carried_by_bucket.get(bucket, 0)
-            if incoming > remaining:
-                blockers.append(
-                    f"{GAMEPLAY_BUCKET_NAMES.get(bucket, str(bucket))} needs {incoming} incoming item(s), but only {max(0, remaining)} carried slot(s) are free."
-                )
-        cross_character = any(
-            row["direction"] == "to_vault" for row in transfers
-        )
-        if int(source["snapshot"].get("vault_item_count") or 0) + int(cross_character) > VAULT_CAPACITY:
-            blockers.append("The vault lacks temporary space for cross-character transfers.")
         raw_source = loadout.get("source_payload", {})
         identifiers = {
             "name_hash": valid_hash(raw_source.get("nameHash")),
-            "icon_hash": valid_hash(raw_source.get("iconHash")),
+            "icon_hash": (
+                valid_hash(loadout.get("cover_icon_hash"))
+                or valid_hash(raw_source.get("iconHash"))
+            ),
             "color_hash": valid_hash(raw_source.get("colorHash")),
         }
         if not any(identifiers.values()):
@@ -1575,8 +2358,10 @@ class LoadoutSyncService:
                 },
                 "current_slot": summarize_slot(current_slot),
                 "items": expected_items,
+                "partial": partial,
                 "classifications": classifications,
                 "transfers": transfers,
+                "socket_clears": socket_clears,
                 "socket_changes": socket_changes,
                 "identifiers": identifiers,
                 "label": f"{loadout['name']} → slot {slot_index + 1}",
@@ -1589,16 +2374,43 @@ class LoadoutSyncService:
         source: dict[str, Any],
         target_character_id: str,
         slot_jobs: list[dict[str, Any]],
+        *,
+        retain_only_desired: bool = False,
     ) -> list[str]:
-        """Account for unique items retained on-character across all slots."""
+        """Plan reversible vault staging for full character buckets."""
         item_defs = self.manifest.resolve_many(
             "DestinyInventoryItemDefinition",
             (int(item["item_hash"]) for item in source["items"]),
         )
-        carried: dict[int, int] = {}
+        carried: dict[int, list[dict[str, Any]]] = {}
         for item in source["items"]:
             if (
                 item["source_kind"] != "character_inventory"
+                or item.get("character_id") != target_character_id
+                or int(item.get("bucket_hash") or 0)
+                == POSTMASTER_BUCKET_HASH
+            ):
+                continue
+            try:
+                bucket = intended_bucket_hash(
+                    item_defs.get(int(item["item_hash"]))
+                )
+            except LoadoutInspectionError:
+                continue
+            if bucket not in REQUIRED_GAMEPLAY_BUCKET_ORDER[:8]:
+                continue
+            carried.setdefault(bucket, []).append(item)
+        incoming: dict[int, dict[str, dict[str, Any]]] = {}
+        desired_ids = {
+            str(item["item_instance_id"])
+            for job in slot_jobs
+            if job["kind"] == "replace"
+            for item in job["items"]
+        }
+        equipped_by_bucket: dict[int, dict[str, Any]] = {}
+        for item in source["items"]:
+            if (
+                item.get("source_kind") != "equipped"
                 or item.get("character_id") != target_character_id
             ):
                 continue
@@ -1608,8 +2420,7 @@ class LoadoutSyncService:
                 )
             except LoadoutInspectionError:
                 continue
-            carried[bucket] = carried.get(bucket, 0) + 1
-        incoming: dict[int, set[str]] = {}
+            equipped_by_bucket[bucket] = item
         for job in slot_jobs:
             if job["kind"] != "replace":
                 continue
@@ -1620,19 +2431,480 @@ class LoadoutSyncService:
             }
             for item in job["items"]:
                 if item["item_instance_id"] in transferred:
-                    incoming.setdefault(item["bucket_hash"], set()).add(
+                    incoming.setdefault(item["bucket_hash"], {})[
                         item["item_instance_id"]
-                    )
+                    ] = item
         blockers = []
-        for bucket, instance_ids in incoming.items():
-            free = CHARACTER_BUCKET_CAPACITY - carried.get(bucket, 0)
-            if len(instance_ids) > free:
+        evacuations: list[dict[str, Any]] = []
+        cleanup_to_vault: list[dict[str, Any]] = []
+        non_desired_carried: dict[int, list[dict[str, Any]]] = {
+            bucket: [
+                item
+                for item in items
+                if str(item["item_instance_id"]) not in desired_ids
+            ]
+            for bucket, items in carried.items()
+        }
+        for bucket, incoming_items in incoming.items():
+            if retain_only_desired:
+                # Set applications calculate peak resident incoming items
+                # after deciding which completed set items must return to the
+                # vault. That produces the exact number of early evacuations.
+                continue
+            free = CHARACTER_BUCKET_CAPACITY - len(carried.get(bucket, []))
+            needed = max(
+                0,
+                len(incoming_items) - free,
+            )
+            candidates = [
+                item for item in non_desired_carried.get(bucket, [])
+                if not (int(item.get("transfer_status") or 0) & 2)
+            ]
+            candidates.sort(key=lambda item: str(item["item_instance_id"]))
+            selected = candidates[:needed]
+            if len(selected) < needed:
                 blockers.append(
                     f"Across this full plan, {GAMEPLAY_BUCKET_NAMES.get(bucket, str(bucket))} needs "
-                    f"{len(instance_ids)} unique incoming item(s), but only "
-                    f"{max(0, free)} carried slot(s) are free."
+                    f"{len(incoming_items)} unique incoming item(s), but only "
+                    f"{max(0, free + len(selected))} safe carried slot(s) can be made available."
                 )
+            evacuations.extend(
+                {
+                    "item_instance_id": str(item["item_instance_id"]),
+                    "item_hash": int(item["item_hash"]),
+                    "item_name": inventory_item_name(
+                        item_defs.get(int(item["item_hash"]))
+                    ),
+                    "target_character_id": target_character_id,
+                }
+                for item in selected
+            )
+        if retain_only_desired:
+            all_non_desired = [
+                item
+                for items in non_desired_carried.values()
+                for item in items
+            ]
+            non_transferable = [
+                item
+                for item in all_non_desired
+                if int(item.get("transfer_status") or 0) & 2
+            ]
+            if non_transferable:
+                blockers.append(
+                    f"{len(non_transferable)} carried non-set gameplay item(s) "
+                    "cannot be moved to the vault."
+                )
+            evacuated_ids = {
+                row["item_instance_id"] for row in evacuations
+            }
+            cleanup_to_vault.extend(
+                {
+                    "item_instance_id": str(item["item_instance_id"]),
+                    "item_hash": int(item["item_hash"]),
+                    "target_character_id": target_character_id,
+                }
+                for item in all_non_desired
+                if str(item["item_instance_id"]) not in evacuated_ids
+                and not (int(item.get("transfer_status") or 0) & 2)
+            )
+            desired_buckets = {
+                int(item["bucket_hash"])
+                for job in slot_jobs
+                if job["kind"] == "replace"
+                for item in job["items"]
+            }
+            for item in source["items"]:
+                if (
+                    item.get("source_kind") != "equipped"
+                    or item.get("character_id") != target_character_id
+                    or str(item["item_instance_id"]) in desired_ids
+                ):
+                    continue
+                try:
+                    bucket = intended_bucket_hash(
+                        item_defs.get(int(item["item_hash"]))
+                    )
+                except LoadoutInspectionError:
+                    continue
+                if bucket not in desired_buckets:
+                    continue
+                if int(item.get("transfer_status") or 0) & 2:
+                    blockers.append(
+                        "An equipped non-set gameplay item that will be "
+                        "displaced cannot be moved to the vault."
+                    )
+                    continue
+                cleanup_to_vault.append(
+                    {
+                        "item_instance_id": str(item["item_instance_id"]),
+                        "item_hash": int(item["item_hash"]),
+                        "target_character_id": target_character_id,
+                    }
+                )
+        cross_character_to_vault = {
+            row["item_instance_id"]
+            for job in slot_jobs
+            if job["kind"] == "replace"
+            for row in job["transfers"]
+            if row["direction"] == "to_vault"
+        }
+        vault_definition = self.manifest.resolve_many(
+            "DestinyInventoryBucketDefinition",
+            (GENERAL_VAULT_BUCKET_HASH,),
+        ).get(GENERAL_VAULT_BUCKET_HASH)
+        configured_capacity = (
+            vault_definition.get("itemCount")
+            if isinstance(vault_definition, dict)
+            else None
+        )
+        vault_capacity = (
+            int(configured_capacity)
+            if isinstance(configured_capacity, int)
+            and configured_capacity > 0
+            else FALLBACK_VAULT_CAPACITY
+        )
+        vault_items = sum(
+            item.get("source_kind") == "vault"
+            and int(item.get("bucket_hash") or 0)
+            == GENERAL_VAULT_BUCKET_HASH
+            for item in source["items"]
+        )
+        available_vault = max(0, vault_capacity - vault_items)
+        preloads: list[dict[str, Any]] = []
+        if not retain_only_desired:
+            preload_needed = max(
+                0,
+                len(evacuations)
+                + bool(cross_character_to_vault)
+                - available_vault,
+            )
+            for bucket, incoming_items in incoming.items():
+                free = CHARACTER_BUCKET_CAPACITY - len(carried.get(bucket, []))
+                for instance_id, item in list(incoming_items.items())[:max(0, free)]:
+                    preloads.append(
+                        {
+                            "item_instance_id": instance_id,
+                            "item_hash": int(item["item_hash"]),
+                            "target_character_id": target_character_id,
+                        }
+                    )
+                    if len(preloads) >= preload_needed:
+                        break
+                if len(preloads) >= preload_needed:
+                    break
+        if not retain_only_desired and (
+            len(evacuations) + bool(cross_character_to_vault)
+            > available_vault + len(preloads)
+        ):
+            blockers.append(
+                "The vault and currently free character slots cannot stage "
+                "the required inventory moves safely."
+            )
+        desired_items_by_id = {
+            str(item["item_instance_id"]): item
+            for job in slot_jobs
+            if job["kind"] == "replace"
+            for item in job["items"]
+        }
+        desired_by_bucket: dict[int, set[str]] = {}
+        last_use: dict[str, int] = {}
+        for job_index, job in enumerate(slot_jobs):
+            if job["kind"] != "replace":
+                continue
+            for item in job["items"]:
+                instance_id = str(item["item_instance_id"])
+                desired_by_bucket.setdefault(
+                    int(item["bucket_hash"]), set()
+                ).add(instance_id)
+                last_use[instance_id] = job_index
+        simulated_equipped = {
+            bucket: str(item["item_instance_id"])
+            for bucket, item in equipped_by_bucket.items()
+        }
+        return_after_job: dict[str, int] = {}
+        if retain_only_desired:
+            for job_index, job in enumerate(slot_jobs):
+                if job["kind"] != "replace":
+                    continue
+                for item in job["items"]:
+                    bucket = int(item["bucket_hash"])
+                    previous = simulated_equipped.get(bucket)
+                    if (
+                        previous is not None
+                        and previous != str(item["item_instance_id"])
+                        and last_use.get(previous, job_index) < job_index
+                    ):
+                        return_after_job[previous] = job_index
+                    simulated_equipped[bucket] = str(
+                        item["item_instance_id"]
+                    )
+        overflow_returns: set[str] = set()
+        if retain_only_desired:
+            total_bucket_capacity = CHARACTER_BUCKET_CAPACITY + 1
+            for bucket, instance_ids in desired_by_bucket.items():
+                overflow = max(0, len(instance_ids) - total_bucket_capacity)
+                if not overflow:
+                    continue
+                final_equipped = simulated_equipped.get(bucket)
+                candidates = [
+                    instance_id
+                    for instance_id in instance_ids
+                    if instance_id != final_equipped
+                    and instance_id in return_after_job
+                ]
+                candidates.sort(
+                    key=lambda instance_id: (
+                        (item_by_instance(source, instance_id) or {}).get(
+                            "source_kind"
+                        ) != "vault",
+                        last_use.get(instance_id, -1),
+                        instance_id,
+                    )
+                )
+                overflow_returns.update(candidates[:overflow])
+                if len(candidates) < overflow:
+                    blockers.append(
+                        f"{GAMEPLAY_BUCKET_NAMES.get(bucket, str(bucket))} "
+                        "contains more unique set items than the character can "
+                        "hold safely."
+                    )
+            returns_by_job: dict[int, list[dict[str, Any]]] = {}
+            for instance_id in overflow_returns:
+                desired = desired_items_by_id[instance_id]
+                returns_by_job.setdefault(
+                    return_after_job[instance_id], []
+                ).append(
+                    {
+                        "item_instance_id": instance_id,
+                        "item_hash": int(desired["item_hash"]),
+                        "target_character_id": target_character_id,
+                    }
+                )
+            for job_index, returns in returns_by_job.items():
+                slot_jobs[job_index]["post_snapshot_vault_returns"] = returns
+            arrivals_seen: set[str] = set()
+            resident_delta: dict[int, int] = {}
+            peak_resident_delta: dict[int, int] = {}
+            returns_by_index = {
+                job_index: {
+                    row["item_instance_id"] for row in returns
+                }
+                for job_index, returns in returns_by_job.items()
+            }
+            for job_index, job in enumerate(slot_jobs):
+                if job["kind"] != "replace":
+                    continue
+                for transfer in job["transfers"]:
+                    instance_id = str(transfer["item_instance_id"])
+                    if (
+                        transfer["direction"] != "from_vault"
+                        or instance_id in arrivals_seen
+                    ):
+                        continue
+                    arrivals_seen.add(instance_id)
+                    bucket = int(
+                        desired_items_by_id[instance_id]["bucket_hash"]
+                    )
+                    resident_delta[bucket] = (
+                        resident_delta.get(bucket, 0) + 1
+                    )
+                    peak_resident_delta[bucket] = max(
+                        peak_resident_delta.get(bucket, 0),
+                        resident_delta[bucket],
+                    )
+                for instance_id in returns_by_index.get(job_index, set()):
+                    bucket = int(
+                        desired_items_by_id[instance_id]["bucket_hash"]
+                    )
+                    resident_delta[bucket] = (
+                        resident_delta.get(bucket, 0) - 1
+                    )
+            evacuations = []
+            for bucket, peak in peak_resident_delta.items():
+                free = max(
+                    0,
+                    CHARACTER_BUCKET_CAPACITY
+                    - len(carried.get(bucket, [])),
+                )
+                needed = max(0, peak - free)
+                candidates = [
+                    item
+                    for item in non_desired_carried.get(bucket, [])
+                    if not (int(item.get("transfer_status") or 0) & 2)
+                ]
+                candidates.sort(
+                    key=lambda item: str(item["item_instance_id"])
+                )
+                selected = candidates[:needed]
+                if len(selected) < needed:
+                    blockers.append(
+                        f"{GAMEPLAY_BUCKET_NAMES.get(bucket, str(bucket))} "
+                        f"needs {needed} temporary carried slot(s), but only "
+                        f"{len(selected)} can be made safely."
+                    )
+                evacuations.extend(
+                    {
+                        "item_instance_id": str(item["item_instance_id"]),
+                        "item_hash": int(item["item_hash"]),
+                        "item_name": inventory_item_name(
+                            item_defs.get(int(item["item_hash"]))
+                        ),
+                        "target_character_id": target_character_id,
+                    }
+                    for item in selected
+                )
+            evacuated_ids = {
+                row["item_instance_id"] for row in evacuations
+            }
+            cleanup_to_vault = [
+                row
+                for row in cleanup_to_vault
+                if row["item_instance_id"] not in evacuated_ids
+            ]
+        retained_original_vault_items = {
+            instance_id
+            for instance_id in desired_ids
+            if (item_by_instance(source, instance_id) or {}).get("source_kind")
+            == "vault"
+            and instance_id not in overflow_returns
+        }
+        returned_non_vault_items = {
+            instance_id
+            for instance_id in overflow_returns
+            if (item_by_instance(source, instance_id) or {}).get("source_kind")
+            != "vault"
+        }
+        final_vault_delta = (
+            len(evacuations)
+            + len(cleanup_to_vault)
+            + len(returned_non_vault_items)
+            - len(retained_original_vault_items)
+        )
+        vault_offloads: list[dict[str, Any]] = []
+        if retain_only_desired:
+            required_vault_space = max(
+                len(evacuations) + bool(cross_character_to_vault),
+                final_vault_delta,
+            )
+            offload_needed = max(0, required_vault_space - available_vault)
+            vault_offloads = self._plan_vault_capacity_offloads(
+                source,
+                item_defs,
+                target_character_id,
+                desired_ids,
+                offload_needed,
+            )
+            if len(vault_offloads) < offload_needed:
+                blockers.append(
+                    "The full vault needs "
+                    f"{offload_needed} spare inventory slot(s) on another "
+                    f"character, but only {len(vault_offloads)} safe slot(s) "
+                    "are available."
+                )
+        replace_jobs = [job for job in slot_jobs if job["kind"] == "replace"]
+        if replace_jobs:
+            replace_jobs[0]["capacity_staging"] = {
+                "vault_offloads": vault_offloads,
+                "preloads": preloads,
+                "evacuations": evacuations,
+                "return_to_vault": [
+                    {
+                        "item_instance_id": instance_id,
+                        "item_hash": int(item["item_hash"]),
+                        "target_character_id": target_character_id,
+                    }
+                    for bucket in incoming.values()
+                    for instance_id, item in bucket.items()
+                ] if not retain_only_desired else [],
+                "restorations": evacuations if not retain_only_desired else [],
+                "cleanup_to_vault": cleanup_to_vault,
+                "retain_only_desired": retain_only_desired,
+            }
         return blockers
+
+    def _plan_vault_capacity_offloads(
+        self,
+        source: dict[str, Any],
+        item_defs: dict[int, dict[str, Any]],
+        target_character_id: str,
+        desired_ids: set[str],
+        needed: int,
+    ) -> list[dict[str, Any]]:
+        """Use spare inventory on other characters when the vault is full."""
+
+        if needed <= 0:
+            return []
+        carried_counts: dict[tuple[str, int], int] = {}
+        for item in source["items"]:
+            character_id = str(item.get("character_id") or "")
+            if (
+                item.get("source_kind") != "character_inventory"
+                or not character_id
+                or character_id == target_character_id
+                or int(item.get("bucket_hash") or 0)
+                == POSTMASTER_BUCKET_HASH
+            ):
+                continue
+            try:
+                bucket = intended_bucket_hash(
+                    item_defs.get(int(item["item_hash"]))
+                )
+            except LoadoutInspectionError:
+                continue
+            if bucket in REQUIRED_GAMEPLAY_BUCKET_ORDER[:8]:
+                key = (character_id, bucket)
+                carried_counts[key] = carried_counts.get(key, 0) + 1
+        destinations: dict[int, list[str]] = {}
+        for character in source["characters"]:
+            character_id = str(character["character_id"])
+            if character_id == target_character_id:
+                continue
+            for bucket in REQUIRED_GAMEPLAY_BUCKET_ORDER[:8]:
+                free = max(
+                    0,
+                    CHARACTER_BUCKET_CAPACITY
+                    - carried_counts.get((character_id, bucket), 0),
+                )
+                destinations.setdefault(bucket, []).extend(
+                    [character_id] * free
+                )
+        candidates: dict[int, list[dict[str, Any]]] = {}
+        for item in source["items"]:
+            instance_id = str(item.get("item_instance_id") or "")
+            if (
+                item.get("source_kind") != "vault"
+                or not instance_id
+                or instance_id in desired_ids
+                or int(item.get("transfer_status") or 0) & 2
+            ):
+                continue
+            try:
+                bucket = intended_bucket_hash(
+                    item_defs.get(int(item["item_hash"]))
+                )
+            except LoadoutInspectionError:
+                continue
+            if bucket in destinations:
+                candidates.setdefault(bucket, []).append(item)
+        planned: list[dict[str, Any]] = []
+        for bucket in REQUIRED_GAMEPLAY_BUCKET_ORDER[:8]:
+            slots = destinations.get(bucket, [])
+            items = sorted(
+                candidates.get(bucket, []),
+                key=lambda item: str(item["item_instance_id"]),
+            )
+            for character_id, item in zip(slots, items, strict=False):
+                planned.append(
+                    {
+                        "item_instance_id": str(item["item_instance_id"]),
+                        "item_hash": int(item["item_hash"]),
+                        "target_character_id": character_id,
+                    }
+                )
+                if len(planned) >= needed:
+                    return planned
+        return planned
 
     def _original_equipment(self, source: dict[str, Any], character_id: str) -> dict[str, Any]:
         wrapper = source["profile"].get("characterEquipment", {}).get("data", {}).get(character_id)
@@ -1740,6 +3012,65 @@ class LoadoutSyncService:
         activity_name: str | None,
     ) -> dict[str, Any]:
         actions: list[dict[str, Any]] = []
+        capacity_staging = next(
+            (
+                job["capacity_staging"]
+                for job in slot_jobs
+                if job.get("capacity_staging")
+            ),
+            {
+                "vault_offloads": [],
+                "preloads": [],
+                "evacuations": [],
+                "return_to_vault": [],
+                "restorations": [],
+                "cleanup_to_vault": [],
+                "retain_only_desired": False,
+            },
+        )
+        for offload in capacity_staging["vault_offloads"]:
+            actions.append(
+                {
+                    "action_type": "transfer_from_vault",
+                    "phase": (
+                        "Using spare inventory on another character to make "
+                        "vault space"
+                    ),
+                    "item_instance_id": offload["item_instance_id"],
+                    "request": {
+                        **offload,
+                        "mode": "vault_capacity_offload",
+                    },
+                    "expected": {},
+                }
+            )
+        for preload in capacity_staging["preloads"]:
+            actions.append(
+                {
+                    "action_type": "transfer_from_vault",
+                    "phase": "Preloading a set item to make vault space",
+                    "item_instance_id": preload["item_instance_id"],
+                    "request": preload,
+                    "expected": {},
+                }
+            )
+        for staged in capacity_staging["evacuations"]:
+            actions.append(
+                {
+                    "action_type": "transfer_to_vault",
+                    "phase": (
+                        "Making temporary character inventory space"
+                        + (
+                            f": {staged['item_name']}"
+                            if staged.get("item_name")
+                            else ""
+                        )
+                    ),
+                    "item_instance_id": staged["item_instance_id"],
+                    "request": {**staged, "mode": "capacity_stage"},
+                    "expected": {},
+                }
+            )
         for job in slot_jobs:
             encounter_id = (job.get("encounter") or {}).get("id")
             assignment_id = (job.get("assignment") or {}).get("id")
@@ -1766,76 +3097,25 @@ class LoadoutSyncService:
                     }
                 )
             item_ids = [item["item_instance_id"] for item in job["items"]]
-            for replacement_group, replacement_label in (
-                ("weapon", "weapon"),
-                ("armor", "armor"),
-            ):
-                actions.extend(
-                    [
-                        {
-                            "action_type": "equip",
-                            "phase": (
-                                f"Replacing currently equipped Exotic "
-                                f"{replacement_label}"
-                            ),
-                            **common,
-                            "request": {
-                                "mode": "exotic_replacements",
-                                "group": replacement_group,
-                            },
-                            "expected": {"items": job["items"]},
-                        },
-                        {
-                            "action_type": "verify_prepared",
-                            "phase": (
-                                f"Verifying Exotic {replacement_label} "
-                                f"replacement"
-                            ),
-                            **common,
-                            "request": {
-                                "mode": "exotic_replacements",
-                                "group": replacement_group,
-                            },
-                            "expected": {"items": job["items"]},
-                        },
-                    ]
-                )
-            for socket_change in job["socket_changes"]:
-                actions.extend(
-                    [
-                        {
-                            "action_type": "insert_socket_plug",
-                            "phase": (
-                                f"Applying {socket_change['item_name']} "
-                                f"socket {socket_change['socket_index'] + 1}"
-                            ),
-                            **common,
-                            "item_instance_id": socket_change[
-                                "item_instance_id"
-                            ],
-                            "request": socket_change,
-                            "expected": socket_change,
-                        },
-                        {
-                            "action_type": "verify_socket_plug",
-                            "phase": (
-                                f"Verifying {socket_change['item_name']} "
-                                f"socket {socket_change['socket_index'] + 1}"
-                            ),
-                            **common,
-                            "item_instance_id": socket_change[
-                                "item_instance_id"
-                            ],
-                            "request": {},
-                            "expected": socket_change,
-                        },
-                    ]
-                )
+            actions.append(
+                {
+                    "action_type": "equip",
+                    "phase": (
+                        "Preparing all equipment and sockets in parallel"
+                    ),
+                    **common,
+                    "request": {
+                        "mode": "parallel_prepare",
+                        "item_instance_ids": item_ids,
+                        "socket_clears": job.get("socket_clears", []),
+                        "socket_changes": job["socket_changes"],
+                    },
+                    "expected": {"items": job["items"]},
+                }
+            )
             actions.extend(
                 [
-                    {"action_type": "equip", "phase": "Equipping exact items", **common, "request": {"item_instance_ids": item_ids}, "expected": {"items": job["items"]}},
-                    {"action_type": "verify_prepared", "phase": "Verifying prepared character", **common, "request": {}, "expected": {"items": job["items"]}},
-                    {"action_type": "snapshot", "phase": "Snapshotting selected slot", **common, "request": {}, "expected": {"items": job["items"]}},
+                    {"action_type": "snapshot", "phase": "Snapshotting selected slot", **common, "request": job["identifiers"], "expected": {"items": job["items"], "partial": bool(job.get("partial"))}},
                 ]
             )
             if any(job["identifiers"].values()):
@@ -1843,15 +3123,31 @@ class LoadoutSyncService:
                     {"action_type": "identifiers", "phase": "Applying slot identifiers", **common, "request": {}, "expected": job["identifiers"]}
                 )
             actions.append(
-                {"action_type": "verify_slot", "phase": "Verifying in-game slot", **common, "request": {}, "expected": {"items": job["items"], "identifiers": job["identifiers"] if any(job["identifiers"].values()) else {}}}
+                {"action_type": "verify_slot", "phase": "Verifying in-game slot", **common, "request": {}, "expected": {"items": job["items"], "partial": bool(job.get("partial")), "identifiers": job["identifiers"] if any(job["identifiers"].values()) else {}}}
             )
-        restore_ids = [item["item_instance_id"] for item in original["items"]]
-        for replacement_group, replacement_label in (
-            ("weapon", "weapon"),
-            ("armor", "armor"),
-        ):
-            actions.extend(
-                [
+            for returned in job.get("post_snapshot_vault_returns", []):
+                actions.append(
+                    {
+                        "action_type": "transfer_to_vault",
+                        "phase": "Returning a completed set item to the vault",
+                        **common,
+                        "item_instance_id": returned["item_instance_id"],
+                        "request": {
+                            **returned,
+                            "mode": "restore_vault_origin",
+                        },
+                        "expected": {},
+                    }
+                )
+        if not capacity_staging["retain_only_desired"]:
+            restore_ids = [
+                item["item_instance_id"] for item in original["items"]
+            ]
+            for replacement_group, replacement_label in (
+                ("weapon", "weapon"),
+                ("armor", "armor"),
+            ):
+                actions.append(
                     {
                         "action_type": "equip",
                         "phase": (
@@ -1863,27 +3159,55 @@ class LoadoutSyncService:
                             "group": replacement_group,
                         },
                         "expected": {"items": original["items"]},
+                    }
+                )
+            actions.append(
+                {
+                    "action_type": "verify_prepared",
+                    "phase": "Verifying restoration Exotic replacements",
+                    "request": {
+                        "mode": "exotic_replacements",
+                        "group": "all",
                     },
-                    {
-                        "action_type": "verify_prepared",
-                        "phase": (
-                            f"Verifying restoration Exotic "
-                            f"{replacement_label} slot"
-                        ),
-                        "request": {
-                            "mode": "exotic_replacements",
-                            "group": replacement_group,
-                        },
-                        "expected": {"items": original["items"]},
-                    },
+                    "expected": {"items": original["items"]},
+                }
+            )
+            actions.extend(
+                [
+                    {"action_type": "restore_equipment", "phase": "Restoring original equipment", "request": {"item_instance_ids": restore_ids}, "expected": {"items": original["items"]}},
+                    {"action_type": "verify_restored", "phase": "Verifying restored equipment", "request": {}, "expected": {"items": original["items"]}},
                 ]
             )
-        actions.extend(
-            [
-                {"action_type": "restore_equipment", "phase": "Restoring original equipment", "request": {"item_instance_ids": restore_ids}, "expected": {"items": original["items"]}},
-                {"action_type": "verify_restored", "phase": "Verifying restored equipment", "request": {}, "expected": {"items": original["items"]}},
-            ]
-        )
+        for cleanup in capacity_staging["cleanup_to_vault"]:
+            actions.append(
+                {
+                    "action_type": "transfer_to_vault",
+                    "phase": "Moving non-set gameplay item to the vault",
+                    "item_instance_id": cleanup["item_instance_id"],
+                    "request": {**cleanup, "mode": "retain_set_only"},
+                    "expected": {},
+                }
+            )
+        for returned in capacity_staging["return_to_vault"]:
+            actions.append(
+                {
+                    "action_type": "transfer_to_vault",
+                    "phase": "Returning loadout item to its original vault location",
+                    "item_instance_id": returned["item_instance_id"],
+                    "request": {**returned, "mode": "restore_vault_origin"},
+                    "expected": {},
+                }
+            )
+        for restored in capacity_staging["restorations"]:
+            actions.append(
+                {
+                    "action_type": "transfer_from_vault",
+                    "phase": "Restoring temporary character inventory staging",
+                    "item_instance_id": restored["item_instance_id"],
+                    "request": restored,
+                    "expected": {},
+                }
+            )
         write_types = {
             "transfer_to_vault",
             "transfer_from_vault",
@@ -1914,6 +3238,11 @@ class LoadoutSyncService:
             "request_count": write_count + read_count,
             "minimum_throttle_seconds": round(minimum, 1),
             "eligibility": "Character must be in orbit, a social space, or offline.",
+            "inventory_policy": (
+                "set_items_only"
+                if capacity_staging["retain_only_desired"]
+                else "restore_original"
+            ),
             "initial_state_fingerprint": state_fingerprint(source),
         }
 
@@ -1933,17 +3262,40 @@ class LoadoutSyncService:
         preview_id = secrets.token_hex(16)
         now = utc_now()
         status = "blocked" if blockers else "ready"
+        warnings = [
+            "Saved armor-mod and subclass differences that Bungie currently "
+            "reports as free and insertable are applied and verified before "
+            "the loadout snapshot. Empty plugs are preserved; unsupported "
+            "socket differences remain blockers.",
+            "Before each complete equip, the saved items for any slots "
+            "currently occupied by Exotic weapon or armor pieces are "
+            "equipped and verified first.",
+        ]
+        if any(job.get("partial") for job in action_plan["slot_jobs"]):
+            warnings.append(
+                "Partial imported loadouts intentionally leave unspecified "
+                "items and blank sockets unchanged while preparing the slot."
+            )
+        if action_plan.get("inventory_policy") == "set_items_only":
+            warnings.append(
+                "After rebuilding the set, transferable carried weapon and "
+                "armor items not used anywhere in the set are moved to the "
+                "vault. The highest occupied board position remains equipped."
+            )
+        vault_offloads = sum(
+            action.get("request", {}).get("mode")
+            == "vault_capacity_offload"
+            for action in action_plan["actions"]
+        )
+        if vault_offloads:
+            warnings.append(
+                f"Because the vault is full, {vault_offloads} transferable "
+                "vault item(s) are moved into spare inventory slots on other "
+                "characters. They remain there after this set finishes."
+            )
         validation = {
             "blockers": dedupe(blockers),
-            "warnings": [
-                "Saved armor-mod and subclass differences that Bungie currently "
-                "reports as free and insertable are applied and verified before "
-                "the loadout snapshot. Empty plugs are preserved; unsupported "
-                "socket differences remain blockers.",
-                "Before each complete equip, the saved items for any slots "
-                "currently occupied by Exotic weapon or armor pieces are "
-                "equipped and verified first.",
-            ],
+            "warnings": warnings,
         }
         manifest_version = str(self.manifest.status()["version"])
         with self.database.connection() as connection:
@@ -2395,6 +3747,30 @@ def item_by_instance(source: dict[str, Any], instance_id: str) -> dict[str, Any]
     return next((item for item in source["items"] if str(item["item_instance_id"]) == str(instance_id)), None)
 
 
+def inventory_item_name(definition: dict[str, Any] | None) -> str:
+    display = (
+        definition.get("displayProperties")
+        if isinstance(definition, dict)
+        else None
+    )
+    name = display.get("name") if isinstance(display, dict) else None
+    return str(name).strip() if isinstance(name, str) else ""
+
+
+def equip_failure_is_transient(reason: int, *, location: str) -> bool:
+    """Recognize equip states that this operation resolves before equipping."""
+
+    if reason <= 0:
+        return False
+    transient_reasons = 2  # ItemUniqueEquipRestricted.
+    if location in {"vault", "another_character"}:
+        # Bungie commonly adds ItemWrapped (16) while an otherwise equippable
+        # item is outside the target character. The planned transfer makes
+        # Bungie re-evaluate that state before the equip request.
+        transient_reasons |= 16
+    return reason & ~transient_reasons == 0
+
+
 def plug_is_live_insertable(
     source: dict[str, Any],
     item: dict[str, Any],
@@ -2472,7 +3848,12 @@ def slot_empty(slot: dict[str, Any]) -> bool:
     return not isinstance(items, list) or not items
 
 
-def slot_matches(slot: dict[str, Any], expected_items: list[dict[str, Any]]) -> bool:
+def slot_matches(
+    slot: dict[str, Any],
+    expected_items: list[dict[str, Any]],
+    *,
+    allow_extra: bool = False,
+) -> bool:
     raw_items = slot.get("items") if isinstance(slot, dict) else None
     if not isinstance(raw_items, list):
         return False
@@ -2480,7 +3861,15 @@ def slot_matches(slot: dict[str, Any], expected_items: list[dict[str, Any]]) -> 
         str(item.get("itemInstanceId")): item
         for item in raw_items if isinstance(item, dict) and valid_instance_id(item.get("itemInstanceId"))
     }
-    if set(actual) != {str(item["item_instance_id"]) for item in expected_items}:
+    expected_ids = {
+        str(item["item_instance_id"]) for item in expected_items
+    }
+    identities_match = (
+        expected_ids <= set(actual)
+        if allow_extra
+        else set(actual) == expected_ids
+    )
+    if not identities_match:
         return False
     for expected in expected_items:
         raw = actual[str(expected["item_instance_id"])]

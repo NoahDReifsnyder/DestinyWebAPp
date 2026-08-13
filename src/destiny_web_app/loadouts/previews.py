@@ -35,10 +35,7 @@ def preview_loadout_set_application(
 ) -> dict[str, Any]:
     """Preview applying every assigned slot and clearing every unassigned slot."""
 
-    return functions.synchronization.create_plan_preview(
-        user_id,
-        plan_id=set_id,
-    )
+    return functions.synchronization.create_set_preview(user_id, set_id=set_id)
 
 
 def get_preview(

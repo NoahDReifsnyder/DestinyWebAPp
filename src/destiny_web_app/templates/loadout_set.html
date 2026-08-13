@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$set_name · Loadout sets</title><link rel="stylesheet" href="/static/loadouts.css">
+<script src="/static/loadout_set.js" defer></script></head>
+<body><header class="topbar"><a class="brand" href="/"><span class="brand-mark">D</span><span>Destiny Web App</span></a>
+<nav><a href="/inventory">Inventory</a><a class="active" href="/loadouts">Loadouts</a><a href="/cleaner/weapons">Weapons</a><a href="/cleaner/armor">Armor</a></nav>
+<div class="account"><span class="account-dot"></span>$guardian_name</div></header>
+<main><nav class="breadcrumb"><a href="/loadouts">Loadouts</a><span>/</span><span>$set_name</span></nav>$notices
+<section class="set-editor-heading"><div><p class="eyebrow">$class_name · 20-slot mirror</p><h1>$set_name</h1>
+<p>Drag reusable loadouts onto the board. Dropping on an occupied slot replaces it; dragging within the board swaps or moves positions.</p></div>
+<form method="post" action="/loadout-sets/preview">$preview_csrf<input type="hidden" name="set_id" value="$set_id">
+<button class="primary-action" type="submit"$preview_disabled>Preview applying set</button><small>Empty positions clear matching Destiny slots. Non-set carried gear moves to the vault, and the highest occupied position remains equipped. If the vault is full, spare inventory on another character may be used to make room. No automatic backup is created.</small></form></section>
+<form method="post" action="/loadout-sets/save" data-set-editor>$save_csrf
+<input type="hidden" name="set_id" value="$set_id"><input type="hidden" name="version" value="$version">
+<section class="set-workspace"><div><div class="set-board" aria-label="Twenty loadout positions">$board</div>
+<div class="set-save-bar"><span data-draft-status>No unsaved changes</span><button type="submit">Save board</button></div></div>
+<aside class="loadout-tray"><p class="eyebrow">Reusable loadouts</p><h2>Drag from library</h2><p>Click an icon, then click a board cell for a keyboard-friendly alternative.</p><div class="tray-grid">$tray</div></aside></section></form>
+<details class="manager-panel"><summary>Rename set</summary><form class="manager-form" method="post" action="/loadout-sets/rename">$rename_csrf
+<input type="hidden" name="set_id" value="$set_id"><label>Name<input name="name" maxlength="100" required value="$set_name"></label><button type="submit">Rename set</button></form></details>
+<section class="danger-zone"><form method="post" action="/loadout-sets/delete">$delete_csrf<input type="hidden" name="set_id" value="$set_id">
+<button type="submit" onclick="return confirm('Permanently delete this set? Its loadouts will remain in the library.')">Delete set</button></form></section>
+</main></body></html>

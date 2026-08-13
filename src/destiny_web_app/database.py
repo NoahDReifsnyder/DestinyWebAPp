@@ -17,11 +17,12 @@ from typing import Any, Iterator, Sequence
 # Loadout-specific migrations 8–12 are initialized by LoadoutStore. Keeping
 # the aggregate version here lets the generic database safely open an existing
 # loadout-enabled database before that subsystem is constructed.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 # Inventory is a live cache. Retain only the active snapshot; saved loadouts
 # are rebased to it during refresh and independently validated by item ID.
 INVENTORY_HISTORY_LIMIT = 1
 CLEANER_HISTORY_LIMIT = 10
+GENERAL_VAULT_BUCKET_HASH = 138197802
 
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
@@ -1036,6 +1037,14 @@ class Database:
         }
         for item in snapshot.items:
             source_counts[item.source_kind] += 1
+        # ProfileInventory includes currencies and consumable containers that
+        # do not consume slots in Destiny's General vault bucket. Only rows in
+        # that bucket count against the vault capacity shown in game.
+        source_counts["vault"] = sum(
+            item.source_kind == "vault"
+            and item.bucket_hash == GENERAL_VAULT_BUCKET_HASH
+            for item in snapshot.items
+        )
 
         with self.connection() as connection:
             connection.execute(
