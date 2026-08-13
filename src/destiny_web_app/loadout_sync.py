@@ -46,6 +46,7 @@ PREVIEW_LIFETIME = timedelta(minutes=5)
 MAX_ACTION_ATTEMPTS = 3
 RETRY_DELAYS = (1.0, 2.0)
 POST_WRITE_REFRESH_DELAYS = (1.0, 2.0, 4.0, 8.0, 12.0, 18.0)
+PREPARATION_VERIFY_DELAYS = (1.0, 2.0, 4.0)
 TRANSFER_INTERVAL = 0.1
 EQUIP_INTERVAL = 0.1
 SOCKET_INTERVAL = 0.5
@@ -1430,13 +1431,15 @@ class LoadoutSyncService:
 
         if action_type == "verify_slot":
             slot = character_slot(source, character_id, action["target_slot_index"])
-            if not slot_matches(
+            differences = slot_mismatch_reasons(
                 slot,
                 expected["items"],
                 allow_extra=bool(expected.get("partial")),
-            ):
+            )
+            if differences:
                 raise LoadoutOperationError(
-                    f"Slot {int(action['target_slot_index']) + 1} did not match the pinned revision."
+                    f"Slot {int(action['target_slot_index']) + 1} did not "
+                    "match the pinned revision: " + "; ".join(differences)
                 )
             if expected.get("identifiers") and not identifiers_match(
                 slot, expected["identifiers"]
@@ -1586,15 +1589,24 @@ class LoadoutSyncService:
                 len(pending),
             )
             if not pending:
-                return {
-                    "message": (
-                        f"Verified {len(changes)} parallel socket write(s)."
-                    ),
-                    "http_status": 200,
-                    "error_code": 1,
-                    "error_status": "Success",
-                    "throttle_seconds": 0,
-                }
+                await asyncio.sleep(SOCKET_INTERVAL)
+                settled_source = await self._fresh_source(owner, access_token)
+                settled_pending = self._pending_socket_changes(
+                    settled_source, changes
+                )
+                if not settled_pending:
+                    return {
+                        "message": (
+                            f"Verified {len(changes)} parallel socket "
+                            "write(s) twice."
+                        ),
+                        "http_status": 200,
+                        "error_code": 1,
+                        "error_status": "Success",
+                        "throttle_seconds": 0,
+                    }
+                latest_source = settled_source
+                pending = settled_pending
             if wave_index + 1 < MAX_ACTION_ATTEMPTS:
                 await asyncio.sleep(RETRY_DELAYS[wave_index])
 
@@ -1653,6 +1665,34 @@ class LoadoutSyncService:
         latest_source = source
         item_ids = [str(item["item_instance_id"]) for item in expected_items]
         last_errors: list[str] = []
+        initial_socket_pending = self._pending_socket_changes(
+            latest_source, socket_changes
+        )
+        armor_items_to_rebuild = {
+            str(change["item_instance_id"])
+            for change in initial_socket_pending
+            if change.get("socket_kind") == "armor mod"
+        }
+        required_clears = [
+            change
+            for change in socket_clears
+            if str(change["item_instance_id"]) in armor_items_to_rebuild
+        ]
+        if required_clears:
+            LOGGER.info(
+                "Clearing %s armor socket(s) before parallel insertion",
+                len(required_clears),
+            )
+            await self._apply_socket_wave(
+                owner,
+                access_token,
+                latest_source,
+                character_id,
+                membership_type,
+                required_clears,
+            )
+            # _apply_socket_wave force-refreshes and verifies every empty plug.
+            latest_source = await self._available_source(owner, access_token)
         for wave_index in range(MAX_ACTION_ATTEMPTS):
             equipment_pending = not equipment_matches(
                 latest_source,
@@ -1678,14 +1718,13 @@ class LoadoutSyncService:
             coroutines = []
             labels: list[str] = []
 
-            def queue_socket(change: dict[str, Any], label: str) -> None:
-                item = item_by_instance(
-                    latest_source, str(change["item_instance_id"])
-                )
+            for change in socket_pending:
+                item_id = str(change["item_instance_id"])
+                item = item_by_instance(latest_source, item_id)
                 if item is None:
                     raise LoadoutOperationError(
                         f"{change['item_name']} disappeared while preparing "
-                        "the loadout."
+                        "its sockets."
                     )
                 if (
                     item.get("character_id") != character_id
@@ -1693,7 +1732,8 @@ class LoadoutSyncService:
                     not in {"character_inventory", "equipped"}
                 ):
                     raise LoadoutOperationError(
-                        f"{change['item_name']} is not on the target character."
+                        f"{change['item_name']} is not on the target "
+                        "character."
                     )
                 if self._free_socket_change(
                     latest_source,
@@ -1708,42 +1748,18 @@ class LoadoutSyncService:
                         f"{int(change['socket_index']) + 1} is no longer "
                         "reported as freely insertable."
                     )
-                labels.append(label)
+                labels.append(
+                    f"socket {item_id}:{int(change['socket_index'])}"
+                )
                 coroutines.append(
                     self.bungie.insert_socket_plug_free(
                         access_token,
-                        item_instance_id=str(change["item_instance_id"]),
+                        item_instance_id=item_id,
                         socket_index=int(change["socket_index"]),
                         plug_hash=int(change["plug_hash"]),
                         character_id=character_id,
                         membership_type=membership_type,
                     )
-                )
-
-            # Empty plugs are preparatory rather than a final target. Submit
-            # them only in the first wave, alongside the desired plugs. If a
-            # same-socket race leaves the empty plug last, final-state
-            # verification resubmits only the desired plug in the next wave.
-            if wave_index == 0:
-                pending_keys = {
-                    (
-                        str(change["item_instance_id"]),
-                        int(change["socket_index"]),
-                    )
-                    for change in socket_pending
-                }
-                for change in socket_clears:
-                    key = (
-                        str(change["item_instance_id"]),
-                        int(change["socket_index"]),
-                    )
-                    if key in pending_keys:
-                        queue_socket(change, f"clear {key[0]}:{key[1]}")
-            for change in socket_pending:
-                queue_socket(
-                    change,
-                    "socket "
-                    f"{change['item_instance_id']}:{change['socket_index']}",
                 )
 
             if equipment_pending:
@@ -1791,6 +1807,7 @@ class LoadoutSyncService:
                 len(socket_pending),
                 equipment_pending,
             )
+            write_started_at = utc_now()
             results = await asyncio.gather(
                 *coroutines, return_exceptions=True
             )
@@ -1806,7 +1823,18 @@ class LoadoutSyncService:
                         throttle, float(result["throttle_seconds"])
                     )
             await asyncio.sleep(max(EQUIP_INTERVAL, SOCKET_INTERVAL, throttle))
-            latest_source = await self._fresh_source(owner, access_token)
+            # Get evidence minted after this wave began. Bungie's profile
+            # endpoint can return HTTP 200 with an older cached component;
+            # treating that response as current made us replay successful
+            # equips and eventually fail before SnapshotLoadout ran.
+            if latest_source.get("snapshot", {}).get("source_minted_at"):
+                latest_source = await self._fresh_source_after(
+                    owner, access_token, write_started_at
+                )
+            else:
+                # Lightweight unit/service callers may provide a normalized
+                # source without persisted snapshot metadata.
+                latest_source = await self._fresh_source(owner, access_token)
             remaining_sockets = self._pending_socket_changes(
                 latest_source, socket_changes
             )
@@ -1816,6 +1844,29 @@ class LoadoutSyncService:
                 expected_items,
                 compare_plugs=False,
             )
+            # A newly minted profile can still represent an intermediate
+            # state while Bungie finishes a bulk equip. Recheck that state a
+            # few times before sending the same writes again.
+            for verification_delay in PREPARATION_VERIFY_DELAYS:
+                if not remaining_equipment and not remaining_sockets:
+                    break
+                LOGGER.info(
+                    "Parallel preparation wave %s is not settled; checking "
+                    "again in %.1f second(s) before retrying writes",
+                    wave_index + 1,
+                    verification_delay,
+                )
+                await asyncio.sleep(verification_delay)
+                latest_source = await self._fresh_source(owner, access_token)
+                remaining_sockets = self._pending_socket_changes(
+                    latest_source, socket_changes
+                )
+                remaining_equipment = not equipment_matches(
+                    latest_source,
+                    character_id,
+                    expected_items,
+                    compare_plugs=False,
+                )
             LOGGER.info(
                 "Parallel preparation wave %s verified; %s socket target(s) "
                 "remain, equipment=%s",
@@ -1823,21 +1874,58 @@ class LoadoutSyncService:
                 len(remaining_sockets),
                 "pending" if remaining_equipment else "verified",
             )
-            if not remaining_equipment and not remaining_sockets:
-                return {
-                    "message": (
-                        "Exact equipment and all saved sockets verified after "
-                        f"{wave_index + 1} parallel wave(s)."
+            if remaining_equipment:
+                LOGGER.info(
+                    "Parallel preparation wave %s still missing equipped "
+                    "item(s): %s",
+                    wave_index + 1,
+                    ", ".join(
+                        missing_equipment_labels(
+                            latest_source, character_id, expected_items
+                        )
                     ),
-                    "http_status": 200,
-                    "error_code": 1,
-                    "error_status": "Success",
-                    "throttle_seconds": throttle,
-                }
+                )
+            if not remaining_equipment and not remaining_sockets:
+                # Require a second observation so a briefly successful
+                # concurrent mutation cannot be snapshotted before Bungie's
+                # eventual item state settles.
+                await asyncio.sleep(SOCKET_INTERVAL)
+                settled_source = await self._fresh_source(owner, access_token)
+                settled_sockets = self._pending_socket_changes(
+                    settled_source, socket_changes
+                )
+                settled_equipment = not equipment_matches(
+                    settled_source,
+                    character_id,
+                    expected_items,
+                    compare_plugs=False,
+                )
+                if not settled_equipment and not settled_sockets:
+                    return {
+                        "message": (
+                            "Exact equipment and all saved sockets verified "
+                            "twice after "
+                            f"{wave_index + 1} parallel wave(s)."
+                        ),
+                        "http_status": 200,
+                        "error_code": 1,
+                        "error_status": "Success",
+                        "throttle_seconds": throttle,
+                    }
+                latest_source = settled_source
             if wave_index + 1 < MAX_ACTION_ATTEMPTS:
                 await asyncio.sleep(RETRY_DELAYS[wave_index])
 
-        detail = "; ".join(last_errors)
+        detail_parts = list(last_errors)
+        missing = missing_equipment_labels(
+            latest_source, character_id, expected_items
+        )
+        if missing:
+            detail_parts.append(
+                "equipment still not reported as equipped: "
+                + ", ".join(missing)
+            )
+        detail = "; ".join(detail_parts)
         raise BungieActionError(
             "Parallel loadout preparation did not converge after retries."
             + (f" Last request errors: {detail}" if detail else ""),
@@ -1991,6 +2079,51 @@ class LoadoutSyncService:
             "category_hash": category_hash,
             "socket_kind": socket_kind,
         }
+
+    def _armor_socket_clear_targets(
+        self,
+        source: dict[str, Any],
+        item: dict[str, Any],
+        target_character_id: str,
+        *,
+        item_name: str,
+    ) -> list[dict[str, Any]]:
+        """Describe every writable empty armor-mod socket on one item."""
+
+        definition = self.manifest.resolve_many(
+            "DestinyInventoryItemDefinition",
+            (int(item["item_hash"]),),
+        ).get(int(item["item_hash"]))
+        sockets = (
+            definition.get("sockets")
+            if isinstance(definition, dict)
+            else None
+        )
+        entries = (
+            sockets.get("socketEntries")
+            if isinstance(sockets, dict)
+            else None
+        )
+        if not isinstance(entries, list):
+            return []
+        targets = []
+        for socket_index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            empty_hash = valid_hash(entry.get("singleInitialItemHash"))
+            if empty_hash is None:
+                continue
+            change = self._free_socket_change(
+                source,
+                item,
+                target_character_id,
+                socket_index=socket_index,
+                plug_hash=empty_hash,
+                item_name=item_name,
+            )
+            if change is not None and change["socket_kind"] == "armor mod":
+                targets.append(change)
+        return targets
 
     def _source(self, owner: str) -> dict[str, Any]:
         source = self.database.load_active_loadout_source(owner)
@@ -2192,6 +2325,7 @@ class LoadoutSyncService:
                 for plug in saved_item["plugs"]
             ]
             current_plugs = component_plug_hashes(item.get("components"))
+            armor_sockets_need_rebuild = False
             for plug in saved_plugs:
                 if plug["filtered"] or plug["plug_hash"] in (
                     None,
@@ -2200,62 +2334,41 @@ class LoadoutSyncService:
                     continue
                 index = plug["socket_index"]
                 current = current_plugs[index] if index < len(current_plugs) else None
-                if current != plug["plug_hash"]:
-                    socket_change = self._free_socket_change(
-                        source,
-                        item,
-                        target_character_id,
-                        socket_index=index,
-                        plug_hash=int(plug["plug_hash"]),
-                        item_name=saved_item["name"],
-                    )
-                    if socket_change is None:
+                socket_change = self._free_socket_change(
+                    source,
+                    item,
+                    target_character_id,
+                    socket_index=index,
+                    plug_hash=int(plug["plug_hash"]),
+                    item_name=saved_item["name"],
+                )
+                if socket_change is None:
+                    if current != plug["plug_hash"]:
                         blockers.append(
                             f"{saved_item['name']} socket {index + 1} differs; "
                             "this plug is not a currently insertable free "
                             "gameplay plug."
                         )
-                    else:
-                        # Armor mod energy is enforced on every individual
-                        # insertion. Clear each changed socket before adding
-                        # any saved mods so an old + new transient combination
-                        # cannot exceed the item's energy capacity.
-                        if (
-                            socket_change["category_hash"]
-                            == ARMOR_MOD_SOCKET_CATEGORY_HASH
-                        ):
-                            socket_data = (definition or {}).get("sockets")
-                            socket_entries = (
-                                socket_data.get("socketEntries", [])
-                                if isinstance(socket_data, dict)
-                                else []
-                            )
-                            socket_entry = (
-                                socket_entries[index]
-                                if isinstance(socket_entries, list)
-                                and index < len(socket_entries)
-                                and isinstance(socket_entries[index], dict)
-                                else {}
-                            )
-                            empty_hash = valid_hash(
-                                socket_entry.get("singleInitialItemHash")
-                            )
-                            if (
-                                empty_hash is not None
-                                and empty_hash != int(plug["plug_hash"])
-                                and current != empty_hash
-                            ):
-                                clear_change = self._free_socket_change(
-                                    source,
-                                    item,
-                                    target_character_id,
-                                    socket_index=index,
-                                    plug_hash=empty_hash,
-                                    item_name=saved_item["name"],
-                                )
-                                if clear_change is not None:
-                                    socket_clears.append(clear_change)
-                        socket_changes.append(socket_change)
+                    continue
+                # Keep every writable saved socket as a final-state target,
+                # even when it matches during preview creation. The executor
+                # can then repair a socket that changes between preview and
+                # execution while still skipping live matches.
+                socket_changes.append(socket_change)
+                if (
+                    socket_change["category_hash"]
+                    == ARMOR_MOD_SOCKET_CATEGORY_HASH
+                ):
+                    armor_sockets_need_rebuild = True
+            if armor_sockets_need_rebuild:
+                socket_clears.extend(
+                    self._armor_socket_clear_targets(
+                        source,
+                        item,
+                        target_character_id,
+                        item_name=saved_item["name"],
+                    )
+                )
             classifications.append(
                 {
                     "name": saved_item["name"],
@@ -3854,9 +3967,20 @@ def slot_matches(
     *,
     allow_extra: bool = False,
 ) -> bool:
+    return not slot_mismatch_reasons(
+        slot, expected_items, allow_extra=allow_extra
+    )
+
+
+def slot_mismatch_reasons(
+    slot: dict[str, Any],
+    expected_items: list[dict[str, Any]],
+    *,
+    allow_extra: bool = False,
+) -> list[str]:
     raw_items = slot.get("items") if isinstance(slot, dict) else None
     if not isinstance(raw_items, list):
-        return False
+        return ["Bungie returned no item list"]
     actual = {
         str(item.get("itemInstanceId")): item
         for item in raw_items if isinstance(item, dict) and valid_instance_id(item.get("itemInstanceId"))
@@ -3864,15 +3988,22 @@ def slot_matches(
     expected_ids = {
         str(item["item_instance_id"]) for item in expected_items
     }
-    identities_match = (
-        expected_ids <= set(actual)
-        if allow_extra
-        else set(actual) == expected_ids
-    )
-    if not identities_match:
-        return False
+    differences = []
+    missing = expected_ids - set(actual)
+    unexpected = set(actual) - expected_ids
+    if missing:
+        differences.append(
+            "missing item(s) " + ", ".join(sorted(missing))
+        )
+    if unexpected and not allow_extra:
+        differences.append(
+            "unexpected item(s) " + ", ".join(sorted(unexpected))
+        )
     for expected in expected_items:
-        raw = actual[str(expected["item_instance_id"])]
+        instance_id = str(expected["item_instance_id"])
+        raw = actual.get(instance_id)
+        if raw is None:
+            continue
         plugs = raw.get("plugItemHashes")
         actual_plugs = plugs if isinstance(plugs, list) else []
         for plug in expected.get("plugs", []):
@@ -3884,8 +4015,33 @@ def slot_matches(
             index = int(plug["socket_index"])
             current = valid_hash(actual_plugs[index]) if index < len(actual_plugs) else None
             if current != plug.get("plug_hash"):
-                return False
-    return True
+                differences.append(
+                    f"{expected.get('name') or instance_id} socket "
+                    f"{index + 1} stored {current}, expected "
+                    f"{plug.get('plug_hash')}"
+                )
+    return differences
+
+
+def missing_equipment_labels(
+    source: dict[str, Any],
+    character_id: str,
+    expected_items: list[dict[str, Any]],
+) -> list[str]:
+    wrapper = (
+        source["profile"]
+        .get("characterEquipment", {})
+        .get("data", {})
+        .get(character_id)
+    )
+    equipped_ids = {
+        str(item.get("itemInstanceId")) for item in component_items(wrapper)
+    }
+    return [
+        str(item.get("name") or item["item_instance_id"])
+        for item in expected_items
+        if str(item["item_instance_id"]) not in equipped_ids
+    ]
 
 
 def equipment_matches(
@@ -3895,10 +4051,7 @@ def equipment_matches(
     *,
     compare_plugs: bool = True,
 ) -> bool:
-    wrapper = source["profile"].get("characterEquipment", {}).get("data", {}).get(character_id)
-    raw = component_items(wrapper)
-    equipped_ids = {str(item.get("itemInstanceId")) for item in raw}
-    if not {str(item["item_instance_id"]) for item in expected_items} <= equipped_ids:
+    if missing_equipment_labels(source, character_id, expected_items):
         return False
     if not compare_plugs:
         return True
