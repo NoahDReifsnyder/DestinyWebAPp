@@ -483,8 +483,16 @@ h1 em { color: var(--gold); font-weight: 400; }
 .progress-track { height: .7rem; margin-top: 1rem; overflow: hidden; background: #05090d; }
 .progress-track span { display: block; height: 100%; background: linear-gradient(90deg, var(--gold), var(--green)); transition: width .35s ease; }
 .operation-progress > p { color: var(--muted); font-size: .62rem; }
+.progress-timing { display: flex; justify-content: space-between; gap: 1rem; color: var(--ink); font-size: .66rem; }
 .operation-action { border-top: 1px solid var(--line); }
 .operation-action summary { display: grid; padding: .7rem; grid-template-columns: 2rem 1fr auto; gap: .7rem; align-items: center; cursor: pointer; }
+.operation-action-group { border-top: 1px solid var(--line); }
+.operation-action-group > summary { display: grid; padding: .85rem .7rem; grid-template-columns: 3rem 1fr auto; gap: .7rem; align-items: center; cursor: pointer; }
+.operation-action-group > summary span { color: var(--faint); font-family: Georgia, serif; }
+.operation-action-group > summary strong { font-size: .66rem; }
+.operation-action-group > summary em { color: var(--muted); font-size: .55rem; font-style: normal; text-transform: uppercase; }
+.operation-action-group > div > p { padding: 0 .7rem; color: var(--muted); font-size: .6rem; }
+.operation-action-group .operation-action { margin-left: 1.5rem; }
 .operation-action summary > span { color: var(--faint); font-family: Georgia, serif; }
 .operation-action summary strong { font-size: .66rem; }.operation-action summary em { color: var(--muted); font-size: .55rem; font-style: normal; text-transform: uppercase; }
 .operation-action.status-completed summary em { color: var(--green); }.operation-action.status-failed summary em { color: var(--red); }

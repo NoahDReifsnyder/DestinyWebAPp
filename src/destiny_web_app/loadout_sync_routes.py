@@ -282,6 +282,11 @@ async def loadout_operation_status(request: web.Request) -> web.Response:
             "completed": operation["completed_actions"],
             "total": operation["total_actions"],
             "progress_percent": operation["progress_percent"],
+            "elapsed_seconds": operation["elapsed_seconds"],
+            "estimated_remaining_seconds": operation[
+                "estimated_remaining_seconds"
+            ],
+            "eta_confidence": operation["eta_confidence"],
             "phase": current["phase"] if current else "Complete",
             "action_number": (
                 int(current["action_index"]) + 1 if current else None
@@ -338,16 +343,34 @@ def render_preview_status(preview: dict) -> str:
 
 def render_preview_summary(preview: dict) -> str:
     plan = preview["action_plan"]
-    replacements = sum(job["kind"] == "replace" for job in plan["slot_jobs"])
-    clears = sum(job["kind"] == "clear" for job in plan["slot_jobs"])
+    speed = plan.get("speed_summary", {})
+    unchanged = sum(bool(job.get("already_correct")) for job in plan["slot_jobs"])
+    replacements = sum(
+        job["kind"] == "replace" and not job.get("already_correct")
+        for job in plan["slot_jobs"]
+    )
+    clears = sum(
+        job["kind"] == "clear" and not job.get("already_correct")
+        for job in plan["slot_jobs"]
+    )
+    timing_copy = (
+        f"Estimated runtime: about {escape(format_duration(speed['estimated_seconds']))} "
+        f"across {int(speed['durable_checkpoints'])} durable checkpoints. "
+        f"Transfer work: {int(speed['transfer_items'])} items in approximately "
+        f"{int(speed['transfer_waves'])} full waves; loadout preparation: "
+        f"{int(speed['unique_preparations'])} unique states; slot clears: "
+        f"{int(speed['clear_slots'])}. This estimate adapts during execution."
+        if speed
+        else "Create a new preview to see the wave-based runtime estimate."
+    )
     return f"""
 <section class="summary preview-summary">
   <div><strong>{replacements}</strong><span>Slots replaced</span></div>
   <div><strong>{clears}</strong><span>Explicit clears</span></div>
+  <div><strong>{unchanged}</strong><span>Already correct</span></div>
   <div><strong>{plan['write_request_count']} + {plan['read_request_count']}</strong><span>Writes + verification reads</span></div>
-  <div><strong>≥ {plan['minimum_throttle_seconds']:.1f}s</strong><span>Minimum action throttle</span></div>
 </section>
-<div class="notice warning">{escape(plan['eligibility'])} This is a lower-bound throttle estimate, not a promised completion time.</div>"""
+<div class="notice warning">{escape(plan['eligibility'])} {timing_copy}</div>"""
 
 
 def render_validation(preview: dict) -> str:
@@ -376,6 +399,12 @@ def render_slot_job(job: dict) -> str:
 <article class="preview-job clear-job">
   <header><span class="slot-pill">Slot {job['display_index']}</span><div><small>{prefix}Explicit unassigned action</small><h3>Clear this slot</h3></div><strong>{escape(current)}</strong></header>
   <p>No assignment exists for this available slot. Confirmation explicitly authorizes clearing it.</p>
+</article>"""
+    if job.get("already_correct"):
+        return f"""
+<article class="preview-job replace-job">
+  <header><span class="slot-pill">Slot {job['display_index']}</span><div><small>{prefix}Pinned revision {job['loadout']['revision_number']}</small><h3>{escape(job['loadout']['name'])}</h3></div><strong>Already correct</strong></header>
+  <p>The saved items, supported sockets, and slot identifiers already match. No preparation or snapshot is planned for this slot.</p>
 </article>"""
     items = "".join(render_preview_item(item) for item in job["classifications"])
     transfers = "".join(
@@ -437,20 +466,77 @@ def render_confirmation(request: web.Request, preview: dict) -> str:
 def render_operation(operation: dict) -> str:
     current = next((row for row in operation["actions"] if row["status"] in {"pending", "running", "failed"}), None)
     phase = current["phase"] if current else "All durable actions complete"
-    actions = "".join(render_action(row) for row in operation["actions"])
+    actions = render_actions(operation["actions"])
     recovery = ""
     if operation.get("recovery"):
         recovery = f"""
 <section class="recovery-card"><p class="eyebrow">Recovery plan</p><h2>{escape(operation['recovery'].get('failed_phase', 'Operation stopped'))}</h2><p>{escape(operation['recovery'].get('reason', ''))}</p><p>{escape(operation['recovery'].get('next_step', ''))}</p></section>"""
     report = render_slot_report(operation)
+    elapsed = format_duration(operation["elapsed_seconds"])
+    remaining = operation["estimated_remaining_seconds"]
+    eta = (
+        f"About {format_duration(remaining)} remaining"
+        if remaining is not None and operation["status"] not in {"completed"}
+        else "Complete"
+        if operation["status"] == "completed"
+        else "ETA unavailable while stopped"
+    )
     return f"""
 <section class="operation-progress" data-operation-id="{escape(operation['operation_id'])}" data-operation-status="{escape(operation['status'])}">
   <div class="operation-heading"><div><p class="eyebrow">{escape(operation['status'])}</p><h2 data-progress-phase>{escape(phase)}</h2></div><strong data-progress-count>{operation['completed_actions']} / {operation['total_actions']}</strong></div>
   <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{operation['progress_percent']}"><span data-progress-bar style="width:{operation['progress_percent']}%"></span></div>
   <p data-progress-copy>{operation['progress_percent']}% complete · every completed checkpoint is durable.</p>
+  <div class="progress-timing"><span data-progress-elapsed>Elapsed: {escape(elapsed)}</span><span data-progress-eta>{escape(eta)}</span></div>
 </section>
 {recovery}{report}
 <section class="operation-actions"><div><p class="eyebrow">Durable audit</p><h2>Action checkpoints</h2></div>{actions}</section>"""
+
+
+def format_duration(seconds: int | float) -> str:
+    total = max(0, round(float(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def render_actions(actions: list[dict]) -> str:
+    """Collapse long consecutive transfer runs without hiding their evidence."""
+
+    groups: list[list[dict]] = []
+    for row in actions:
+        if (
+            groups
+            and row["action_type"] == groups[-1][0]["action_type"]
+            and row["phase"] == groups[-1][0]["phase"]
+            and row.get("target_slot_index") is None
+        ):
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    rendered = []
+    for group in groups:
+        if len(group) < 4:
+            rendered.extend(render_action(row) for row in group)
+            continue
+        completed = sum(
+            row["status"] in {"completed", "skipped"} for row in group
+        )
+        failed = sum(row["status"] == "failed" for row in group)
+        status = "failed" if failed else "completed" if completed == len(group) else "pending"
+        start = int(group[0]["action_index"]) + 1
+        end = int(group[-1]["action_index"]) + 1
+        rendered.append(
+            f"""
+<details class="operation-action-group status-{status}">
+  <summary><span>{start}–{end}</span><strong>{escape(group[0]['phase'])}</strong><em>{completed} / {len(group)} complete</em></summary>
+  <div><p>{len(group)} item-level API actions are grouped here. Expand for their durable evidence.</p>{''.join(render_action(row) for row in group)}</div>
+</details>"""
+        )
+    return "".join(rendered)
 
 
 def render_action(action: dict) -> str:

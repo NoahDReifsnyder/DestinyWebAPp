@@ -9,6 +9,7 @@ import logging
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from statistics import median
 from typing import TYPE_CHECKING, Any, Iterable
 
 from destiny_web_app.bungie import (
@@ -48,9 +49,30 @@ RETRY_DELAYS = (1.0, 2.0)
 POST_WRITE_REFRESH_DELAYS = (1.0, 2.0, 4.0, 8.0, 12.0, 18.0)
 PREPARATION_VERIFY_DELAYS = (1.0, 2.0, 4.0)
 TRANSFER_INTERVAL = 0.1
+TRANSFER_WAVE_SIZE = 8
 EQUIP_INTERVAL = 0.1
 SOCKET_INTERVAL = 0.5
 LOADOUT_INTERVAL = 1.0
+CLEAR_LOADOUT_INTERVAL = 1.0
+ACTION_DURATION_DEFAULTS = {
+    "transfer_to_vault": 3.0,
+    "transfer_from_vault": 3.0,
+    "transfer_to_vault:parallel_transfer": 10.0,
+    "transfer_from_vault:parallel_transfer": 10.0,
+    "transfer_to_vault:inventory_pipeline": 10.0,
+    "equip": 4.0,
+    "equip:parallel_prepare": 30.0,
+    "insert_socket_plug": 4.0,
+    "snapshot": 4.0,
+    "identifiers": 2.0,
+    "verify_prepared": 3.0,
+    "verify_slot": 3.0,
+    "clear_slot": 3.0,
+    "verify_clear": 3.0,
+    "restore_equipment": 4.0,
+    "verify_restored": 3.0,
+    "clear_slot:parallel_clear": 25.0,
+}
 # Bungie's bucket definition reports ten total slots: one equipped item plus
 # nine carried items.
 CHARACTER_BUCKET_CAPACITY = 9
@@ -252,6 +274,7 @@ class LoadoutSyncService:
             slot_jobs.append(
                 {
                     "kind": "clear",
+                    "already_correct": slot_empty(slots[slot_index]),
                     "slot_index": slot_index,
                     "display_index": slot_index + 1,
                     "encounter": None,
@@ -331,6 +354,7 @@ class LoadoutSyncService:
                 slot_jobs.append(
                     {
                         "kind": "clear",
+                        "already_correct": slot_empty(live_slots[position]),
                         "slot_index": position,
                         "display_index": position + 1,
                         "encounter": None,
@@ -364,11 +388,15 @@ class LoadoutSyncService:
             )
             slot_jobs.append(job)
             blockers.extend(job_blockers)
+        display_jobs = list(slot_jobs)
+        execution_jobs = self._optimized_set_job_order(
+            source, target_character_id, slot_jobs
+        )
         blockers.extend(
             self._aggregate_plan_capacity_blockers(
                 source,
                 target_character_id,
-                slot_jobs,
+                execution_jobs,
                 retain_only_desired=True,
             )
         )
@@ -377,10 +405,13 @@ class LoadoutSyncService:
         action_plan = self._finalize_action_plan(
             source,
             character,
-            slot_jobs,
+            execution_jobs,
             original,
             title=str(board["name"]),
             activity_name=None,
+        )
+        action_plan["slot_jobs"] = sorted(
+            display_jobs, key=lambda job: int(job["slot_index"])
         )
         action_plan["set_version"] = int(board["version"])
         action_plan["clears_empty_positions"] = True
@@ -743,6 +774,7 @@ class LoadoutSyncService:
             else 100
         )
         result["can_resume"] = result["status"] in {"paused", "failed"}
+        result.update(operation_timing(result))
         return result
 
     def recent_operations(self, owner: str, *, limit: int = 10) -> list[dict[str, Any]]:
@@ -949,12 +981,47 @@ class LoadoutSyncService:
         for checkpoint in operation["actions"]:
             if checkpoint["status"] != "completed":
                 continue
+            if (
+                checkpoint["action_type"] == "clear_slot"
+                and checkpoint.get("request", {}).get("mode")
+                == "parallel_clear"
+            ):
+                diverged = [
+                    int(slot_index) + 1
+                    for slot_index in checkpoint["request"].get(
+                        "slot_indexes", []
+                    )
+                    if not slot_empty(
+                        character_slot(source, character_id, int(slot_index))
+                    )
+                ]
+                if diverged:
+                    raise LoadoutOperationError(
+                        "Previously cleared slot(s) diverged: "
+                        + ", ".join(map(str, diverged))
+                    )
+                continue
             slot_index = checkpoint.get("target_slot_index")
             if slot_index is None:
                 continue
-            if checkpoint["action_type"] == "verify_slot":
+            if checkpoint["action_type"] == "verify_slot" or (
+                checkpoint["action_type"] == "snapshot"
+                and checkpoint.get("request", {}).get("mode")
+                == "snapshot_verify"
+            ):
                 slot = character_slot(source, character_id, slot_index)
-                if not slot_matches(slot, checkpoint["expected"]["items"]):
+                if not slot_matches(
+                    slot,
+                    checkpoint["expected"]["items"],
+                    allow_extra=bool(
+                        checkpoint["expected"].get("partial")
+                    ),
+                ) or (
+                    checkpoint["expected"].get("identifiers")
+                    and not identifiers_match(
+                        slot, checkpoint["expected"]["identifiers"]
+                    )
+                ):
                     raise LoadoutOperationError(
                         f"Previously completed slot {slot_index + 1} diverged; "
                         "resume stopped before another write."
@@ -1063,7 +1130,9 @@ class LoadoutSyncService:
         character_id = operation["target_character_id"]
         minted_after = self._verification_minted_after(operation, action)
         source = (
-            await self._fresh_source_after(
+            await self._fresh_source(owner, access_token)
+            if action_type == "cleanup_inventory"
+            else await self._fresh_source_after(
                 owner,
                 access_token,
                 minted_after,
@@ -1080,6 +1149,22 @@ class LoadoutSyncService:
             )
 
         if action_type in {"transfer_to_vault", "transfer_from_vault"}:
+            transfers = request.get("transfers")
+            if isinstance(transfers, list):
+                return await self._transfer_wave(
+                    owner,
+                    access_token,
+                    source,
+                    membership_type,
+                    direction=(
+                        "mixed"
+                        if request.get("mode") == "inventory_pipeline"
+                        else "to_vault"
+                        if action_type == "transfer_to_vault"
+                        else "from_vault"
+                    ),
+                    transfers=transfers,
+                )
             item = item_by_instance(source, action["item_instance_id"])
             if item is None:
                 raise LoadoutOperationError("The exact transfer item is missing.")
@@ -1116,7 +1201,9 @@ class LoadoutSyncService:
                 )
                 moved = item_by_instance(verified, action["item_instance_id"])
                 if moved is None or moved["source_kind"] != "vault":
-                    raise LoadoutOperationError("Transfer-to-vault did not verify.")
+                    raise LoadoutOperationError(
+                        "Transfer-to-vault did not verify."
+                    )
                 return result
             if (
                 item.get("character_id") == terminal_character
@@ -1144,6 +1231,59 @@ class LoadoutSyncService:
             if moved is None or moved.get("character_id") != terminal_character:
                 raise LoadoutOperationError("Transfer-from-vault did not verify.")
             return result
+
+        if action_type == "cleanup_inventory":
+            desired_ids = {
+                str(instance_id)
+                for instance_id in expected.get(
+                    "desired_item_instance_ids", []
+                )
+            }
+            non_set = [
+                item
+                for item in source["items"]
+                if item.get("source_kind") == "character_inventory"
+                and str(item.get("character_id")) == character_id
+                and int(item.get("bucket_hash") or 0)
+                in REQUIRED_GAMEPLAY_BUCKET_ORDER[:8]
+                and str(item.get("item_instance_id") or "")
+                not in desired_ids
+            ]
+            non_transferable = [
+                item
+                for item in non_set
+                if int(item.get("transfer_status") or 0) & 2
+            ]
+            if non_transferable:
+                raise LoadoutOperationError(
+                    "Final inventory cleanup found "
+                    f"{len(non_transferable)} non-set gameplay item(s) that "
+                    "cannot be moved to the vault."
+                )
+            transfers = [
+                {
+                    "direction": "to_vault",
+                    "item_instance_id": str(item["item_instance_id"]),
+                    "item_hash": int(item["item_hash"]),
+                    "target_character_id": character_id,
+                }
+                for item in non_set
+            ]
+            if not transfers:
+                return {
+                    "message": (
+                        "Final inventory cleanup verified: only set gameplay "
+                        "items remain carried."
+                    )
+                }
+            return await self._transfer_wave(
+                owner,
+                access_token,
+                source,
+                membership_type,
+                direction="to_vault",
+                transfers=transfers,
+            )
 
         if action_type == "insert_socket_plug":
             changes = request.get("changes")
@@ -1269,6 +1409,9 @@ class LoadoutSyncService:
                 expected["items"],
                 request.get("socket_clears", []),
                 request.get("socket_changes", []),
+                defer_verification=bool(
+                    request.get("verify_with_snapshot")
+                ),
             )
 
         if (
@@ -1395,22 +1538,170 @@ class LoadoutSyncService:
 
         if action_type == "snapshot":
             slot = character_slot(source, character_id, action["target_slot_index"])
-            if slot_matches(
+            items_match = slot_matches(
                 slot,
                 expected["items"],
                 allow_extra=bool(expected.get("partial")),
-            ):
-                return {"message": "Target slot already matches; snapshot skipped."}
-            result = await self.bungie.snapshot_loadout(
-                access_token,
-                loadout_index=int(action["target_slot_index"]),
-                character_id=character_id,
-                membership_type=membership_type,
-                color_hash=valid_hash(request.get("color_hash")),
-                icon_hash=valid_hash(request.get("icon_hash")),
-                name_hash=valid_hash(request.get("name_hash")),
             )
-            await asyncio.sleep(max(LOADOUT_INTERVAL, result["throttle_seconds"]))
+            expected_identifiers = expected.get("identifiers", {})
+            identifiers_are_correct = (
+                not expected_identifiers
+                or identifiers_match(slot, expected_identifiers)
+            )
+            if items_match and identifiers_are_correct:
+                return {
+                    "message": "Target slot already matches; snapshot skipped."
+                }
+            if request.get("mode") != "snapshot_verify":
+                if items_match:
+                    return {"message": "Target slot already matches; snapshot skipped."}
+                result = await self.bungie.snapshot_loadout(
+                    access_token,
+                    loadout_index=int(action["target_slot_index"]),
+                    character_id=character_id,
+                    membership_type=membership_type,
+                    color_hash=valid_hash(request.get("color_hash")),
+                    icon_hash=valid_hash(request.get("icon_hash")),
+                    name_hash=valid_hash(request.get("name_hash")),
+                )
+                await asyncio.sleep(
+                    max(LOADOUT_INTERVAL, result["throttle_seconds"])
+                )
+                return result
+
+            latest_source = source
+            result: dict[str, Any] = {
+                "http_status": 200,
+                "error_code": 1,
+                "error_status": "Success",
+                "throttle_seconds": 0,
+            }
+            if not items_match:
+                write_started_at = utc_now()
+                result = await self.bungie.snapshot_loadout(
+                    access_token,
+                    loadout_index=int(action["target_slot_index"]),
+                    character_id=character_id,
+                    membership_type=membership_type,
+                    color_hash=valid_hash(request.get("color_hash")),
+                    icon_hash=valid_hash(request.get("icon_hash")),
+                    name_hash=valid_hash(request.get("name_hash")),
+                )
+                await asyncio.sleep(
+                    max(LOADOUT_INTERVAL, result["throttle_seconds"])
+                )
+                latest_source = await self._fresh_source_after(
+                    owner, access_token, write_started_at
+                )
+                for verification_delay in PREPARATION_VERIFY_DELAYS:
+                    current_slot = character_slot(
+                        latest_source,
+                        character_id,
+                        int(action["target_slot_index"]),
+                    )
+                    if slot_matches(
+                        current_slot,
+                        expected["items"],
+                        allow_extra=bool(expected.get("partial")),
+                    ):
+                        break
+                    await asyncio.sleep(verification_delay)
+                    latest_source = await self._fresh_source(
+                        owner, access_token
+                    )
+            slot = character_slot(
+                latest_source,
+                character_id,
+                int(action["target_slot_index"]),
+            )
+            differences = slot_mismatch_reasons(
+                slot,
+                expected["items"],
+                allow_extra=bool(expected.get("partial")),
+            )
+            if differences and request.get("socket_changes") is not None:
+                # The normal fast path verifies preparation through the saved
+                # slot, avoiding a full profile read between socket writes and
+                # SnapshotLoadout. If that combined verification exposes a
+                # lagging or failed member, repair only the still-missing
+                # preparation targets and snapshot once more.
+                await self._prepare_loadout_wave(
+                    owner,
+                    access_token,
+                    latest_source,
+                    character_id,
+                    membership_type,
+                    expected["items"],
+                    request.get("socket_clears", []),
+                    request.get("socket_changes", []),
+                )
+                write_started_at = utc_now()
+                result = await self.bungie.snapshot_loadout(
+                    access_token,
+                    loadout_index=int(action["target_slot_index"]),
+                    character_id=character_id,
+                    membership_type=membership_type,
+                    color_hash=valid_hash(request.get("color_hash")),
+                    icon_hash=valid_hash(request.get("icon_hash")),
+                    name_hash=valid_hash(request.get("name_hash")),
+                )
+                await asyncio.sleep(
+                    max(LOADOUT_INTERVAL, result["throttle_seconds"])
+                )
+                latest_source = await self._fresh_source_after(
+                    owner, access_token, write_started_at
+                )
+                slot = character_slot(
+                    latest_source,
+                    character_id,
+                    int(action["target_slot_index"]),
+                )
+                differences = slot_mismatch_reasons(
+                    slot,
+                    expected["items"],
+                    allow_extra=bool(expected.get("partial")),
+                )
+            if differences:
+                raise LoadoutOperationError(
+                    f"Slot {int(action['target_slot_index']) + 1} did not "
+                    "verify after snapshot: " + "; ".join(differences)
+                )
+            if expected_identifiers and not identifiers_match(
+                slot, expected_identifiers
+            ):
+                write_started_at = utc_now()
+                identifier_result = (
+                    await self.bungie.update_loadout_identifiers(
+                        access_token,
+                        loadout_index=int(action["target_slot_index"]),
+                        character_id=character_id,
+                        membership_type=membership_type,
+                        name_hash=expected_identifiers.get("name_hash"),
+                        icon_hash=expected_identifiers.get("icon_hash"),
+                        color_hash=expected_identifiers.get("color_hash"),
+                    )
+                )
+                await asyncio.sleep(
+                    max(
+                        LOADOUT_INTERVAL,
+                        identifier_result["throttle_seconds"],
+                    )
+                )
+                latest_source = await self._fresh_source_after(
+                    owner, access_token, write_started_at
+                )
+                slot = character_slot(
+                    latest_source,
+                    character_id,
+                    int(action["target_slot_index"]),
+                )
+                if not identifiers_match(slot, expected_identifiers):
+                    raise LoadoutOperationError(
+                        "The slot identifiers did not verify."
+                    )
+            result["message"] = (
+                "In-game slot items and identifiers verified together."
+            )
             return result
 
         if action_type == "identifiers":
@@ -1448,6 +1739,15 @@ class LoadoutSyncService:
             return {"message": "Exact in-game slot verified."}
 
         if action_type == "clear_slot":
+            if request.get("mode") == "parallel_clear":
+                return await self._clear_loadout_wave(
+                    owner,
+                    access_token,
+                    source,
+                    character_id,
+                    membership_type,
+                    [int(value) for value in request["slot_indexes"]],
+                )
             slot = character_slot(source, character_id, action["target_slot_index"])
             if slot_empty(slot):
                 return {"message": "Unassigned slot was already empty."}
@@ -1485,6 +1785,181 @@ class LoadoutSyncService:
                 raise LoadoutOperationError("Original equipment did not fully restore.")
             return {"message": "Original equipment restored and verified."}
         raise LoadoutOperationError(f"Unsupported operation action {action_type}.")
+
+    async def _transfer_wave(
+        self,
+        owner: str,
+        access_token: str,
+        source: dict[str, Any],
+        membership_type: int,
+        *,
+        direction: str,
+        transfers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Converge a bounded set of independent inventory transfers."""
+
+        latest_source = source
+        pending = list(transfers)
+        last_errors: list[str] = []
+        throttle = 0.0
+
+        def transfer_complete(
+            current_source: dict[str, Any], transfer: dict[str, Any]
+        ) -> bool:
+            item = item_by_instance(
+                current_source, str(transfer["item_instance_id"])
+            )
+            if item is None:
+                return False
+            transfer_direction = (
+                str(transfer["direction"])
+                if direction == "mixed"
+                else direction
+            )
+            if transfer_direction == "to_vault":
+                return item.get("source_kind") == "vault"
+            return (
+                item.get("source_kind")
+                in {"character_inventory", "equipped"}
+                and str(item.get("character_id"))
+                == str(transfer["target_character_id"])
+            )
+
+        queue = [
+            transfer
+            for transfer in pending
+            if not transfer_complete(latest_source, transfer)
+        ]
+        if not queue:
+            return {"message": "Every transfer in this wave was already complete."}
+        attempts: dict[str, int] = {}
+        wave_index = 0
+        while queue:
+            pending = queue[:TRANSFER_WAVE_SIZE]
+            queue = queue[TRANSFER_WAVE_SIZE:]
+            wave_index += 1
+            for transfer in pending:
+                instance_id = str(transfer["item_instance_id"])
+                attempts[instance_id] = attempts.get(instance_id, 0) + 1
+            write_started_at = utc_now()
+
+            async def send_transfer(
+                transfer: dict[str, Any], offset: int
+            ) -> dict[str, Any]:
+                if offset:
+                    await asyncio.sleep(offset * TRANSFER_INTERVAL)
+                item = item_by_instance(
+                    latest_source, str(transfer["item_instance_id"])
+                )
+                if item is None:
+                    raise LoadoutOperationError(
+                        "An exact transfer item disappeared."
+                    )
+                transfer_direction = (
+                    str(transfer["direction"])
+                    if direction == "mixed"
+                    else direction
+                )
+                if transfer_direction == "to_vault":
+                    if item.get("source_kind") != "character_inventory":
+                        raise LoadoutOperationError(
+                            "A batched item cannot move to the vault from "
+                            "its current location."
+                        )
+                    character_id = str(item["character_id"])
+                    transfer_to_vault = True
+                else:
+                    if item.get("source_kind") != "vault":
+                        raise LoadoutOperationError(
+                            "A batched item is no longer in the vault."
+                        )
+                    character_id = str(transfer["target_character_id"])
+                    transfer_to_vault = False
+                return await self.bungie.transfer_item(
+                    access_token,
+                    item_instance_id=str(transfer["item_instance_id"]),
+                    item_hash=int(transfer["item_hash"]),
+                    character_id=character_id,
+                    membership_type=membership_type,
+                    transfer_to_vault=transfer_to_vault,
+                )
+
+            results = await asyncio.gather(
+                *(
+                    send_transfer(transfer, offset)
+                    for offset, transfer in enumerate(pending)
+                ),
+                return_exceptions=True,
+            )
+            last_errors = []
+            throttle = 0.0
+            for transfer, result in zip(pending, results, strict=True):
+                if isinstance(result, BungieAuthenticationRejected):
+                    raise result
+                if isinstance(result, Exception):
+                    last_errors.append(
+                        f"item …{str(transfer['item_instance_id'])[-8:]}: "
+                        f"{result}"
+                    )
+                else:
+                    throttle = max(
+                        throttle, float(result["throttle_seconds"])
+                    )
+            await asyncio.sleep(max(TRANSFER_INTERVAL, throttle))
+            if latest_source.get("snapshot", {}).get("source_minted_at"):
+                latest_source = await self._fresh_source_after(
+                    owner, access_token, write_started_at
+                )
+            else:
+                latest_source = await self._fresh_source(owner, access_token)
+            pending = [
+                transfer
+                for transfer in pending
+                if not transfer_complete(latest_source, transfer)
+            ]
+            for verification_delay in PREPARATION_VERIFY_DELAYS:
+                if not pending:
+                    break
+                await asyncio.sleep(verification_delay)
+                latest_source = await self._fresh_source(owner, access_token)
+                pending = [
+                    transfer
+                    for transfer in pending
+                    if not transfer_complete(latest_source, transfer)
+                ]
+            LOGGER.info(
+                "Transfer wave %s verified; %s failed member(s), %s queued "
+                "item(s) remain",
+                wave_index,
+                len(pending),
+                len(queue),
+            )
+            exhausted = [
+                transfer
+                for transfer in pending
+                if attempts[str(transfer["item_instance_id"])]
+                >= MAX_ACTION_ATTEMPTS
+            ]
+            if exhausted:
+                details = "; ".join(last_errors)
+                raise BungieActionError(
+                    "Transfer wave did not converge; "
+                    f"{len(exhausted)} item(s) exhausted retries."
+                    + (f" Last request errors: {details}" if details else ""),
+                    error_status="ParallelTransferDidNotVerify",
+                    transient=False,
+                )
+            # Failed/unverified members lead the next wave, then new queued
+            # work fills every remaining slot up to Bungie's transfer cap.
+            queue = [*pending, *queue]
+
+        return {
+            "message": f"{len(transfers)} transfer(s) verified in full waves.",
+            "http_status": 200,
+            "error_code": 1,
+            "error_status": "Success",
+            "throttle_seconds": throttle,
+        }
 
     async def _apply_socket_wave(
         self,
@@ -1649,6 +2124,301 @@ class LoadoutSyncService:
                 pending.append(change)
         return pending
 
+    async def _clear_loadout_wave(
+        self,
+        owner: str,
+        access_token: str,
+        source: dict[str, Any],
+        character_id: str,
+        membership_type: int,
+        slot_indexes: list[int],
+    ) -> dict[str, Any]:
+        """Clear target slots at Bungie's rate limit and verify them as a set."""
+
+        latest_source = source
+        pending = [
+            index
+            for index in slot_indexes
+            if not slot_empty(character_slot(latest_source, character_id, index))
+        ]
+        if not pending:
+            return {"message": "All unassigned slots were already empty."}
+        last_errors: list[str] = []
+        throttle = 0.0
+        for wave_index in range(MAX_ACTION_ATTEMPTS):
+            write_started_at = utc_now()
+            last_errors = []
+            throttle = 0.0
+            # ClearLoadout is explicitly limited to one request per second
+            # per user. Concurrent requests can return nominal responses yet
+            # leave every slot unchanged, so keep this one durable group but
+            # pace its individual writes.
+            for request_index, index in enumerate(pending):
+                try:
+                    result = await self.bungie.clear_loadout(
+                        access_token,
+                        loadout_index=index,
+                        character_id=character_id,
+                        membership_type=membership_type,
+                    )
+                except BungieAuthenticationRejected:
+                    raise
+                except Exception as error:
+                    last_errors.append(f"slot {index + 1}: {error}")
+                else:
+                    throttle = max(
+                        throttle, float(result["throttle_seconds"])
+                    )
+                if request_index + 1 < len(pending):
+                    await asyncio.sleep(
+                        max(CLEAR_LOADOUT_INTERVAL, throttle)
+                    )
+            await asyncio.sleep(max(LOADOUT_INTERVAL, throttle))
+            if latest_source.get("snapshot", {}).get("source_minted_at"):
+                latest_source = await self._fresh_source_after(
+                    owner, access_token, write_started_at
+                )
+            else:
+                latest_source = await self._fresh_source(owner, access_token)
+            pending = [
+                index
+                for index in pending
+                if not slot_empty(
+                    character_slot(latest_source, character_id, index)
+                )
+            ]
+            for verification_delay in PREPARATION_VERIFY_DELAYS:
+                if not pending:
+                    break
+                await asyncio.sleep(verification_delay)
+                latest_source = await self._fresh_source(owner, access_token)
+                pending = [
+                    index
+                    for index in pending
+                    if not slot_empty(
+                        character_slot(latest_source, character_id, index)
+                    )
+                ]
+            LOGGER.info(
+                "Parallel clear wave %s/%s verified; %s slot(s) remain: %s",
+                wave_index + 1,
+                MAX_ACTION_ATTEMPTS,
+                len(pending),
+                ", ".join(str(index + 1) for index in pending) or "none",
+            )
+            if not pending:
+                return {
+                    "message": (
+                        f"{len(slot_indexes)} unassigned slot(s) verified "
+                        "empty in parallel."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": throttle,
+                }
+            if wave_index + 1 < MAX_ACTION_ATTEMPTS:
+                await asyncio.sleep(RETRY_DELAYS[wave_index])
+        details = "; ".join(last_errors)
+        raise BungieActionError(
+            "Loadout slot clearing did not converge. Still populated: "
+            + ", ".join(str(index + 1) for index in pending)
+            + (f". Last request errors: {details}" if details else ""),
+            error_status="ParallelClearDidNotVerify",
+            transient=False,
+        )
+
+    def _plan_socket_transition_waves(
+        self,
+        source: dict[str, Any],
+        changes: list[dict[str, Any]],
+        clear_candidates: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        """Plan the fewest safe armor-energy stages without probe writes."""
+
+        if not changes:
+            return []
+        immediate = [
+            change
+            for change in changes
+            if change.get("socket_kind") != "armor mod"
+        ]
+        armor_by_item: dict[str, list[dict[str, Any]]] = {}
+        for change in changes:
+            if change.get("socket_kind") == "armor mod":
+                armor_by_item.setdefault(
+                    str(change["item_instance_id"]), []
+                ).append(change)
+        deferred: list[dict[str, Any]] = []
+        if not armor_by_item:
+            return [immediate]
+
+        plug_hashes: set[int] = set()
+        current_by_item: dict[str, list[int | None]] = {}
+        energy_by_item: dict[str, tuple[int, int]] = {}
+        for instance_id in armor_by_item:
+            item = item_by_instance(source, instance_id)
+            if item is None:
+                raise LoadoutOperationError(
+                    "An armor item disappeared while planning socket energy."
+                )
+            plugs = component_plug_hashes(item.get("components"))
+            current_by_item[instance_id] = plugs
+            plug_hashes.update(
+                int(plug_hash) for plug_hash in plugs
+                if plug_hash is not None
+            )
+            instance = item.get("components", {}).get("instances", {})
+            energy = (
+                instance.get("energy")
+                if isinstance(instance, dict)
+                else None
+            )
+            capacity = (
+                energy.get("energyCapacity")
+                if isinstance(energy, dict)
+                else None
+            )
+            used = (
+                energy.get("energyUsed")
+                if isinstance(energy, dict)
+                else None
+            )
+            if (
+                isinstance(capacity, int)
+                and not isinstance(capacity, bool)
+                and isinstance(used, int)
+                and not isinstance(used, bool)
+            ):
+                energy_by_item[instance_id] = (capacity, used)
+        if not energy_by_item:
+            immediate.extend(
+                change
+                for item_changes in armor_by_item.values()
+                for change in item_changes
+            )
+            return [immediate]
+        plug_hashes.update(int(change["plug_hash"]) for change in changes)
+        plug_hashes.update(
+            int(change["plug_hash"]) for change in clear_candidates
+        )
+        definitions = self.manifest.resolve_many(
+            "DestinyInventoryItemDefinition", plug_hashes
+        )
+
+        def energy_cost(plug_hash: int | None) -> int | None:
+            if plug_hash is None:
+                return 0
+            definition = definitions.get(int(plug_hash))
+            if not isinstance(definition, dict):
+                return None
+            plug = definition.get("plug")
+            energy = (
+                plug.get("energyCost")
+                if isinstance(plug, dict)
+                else None
+            )
+            cost = (
+                energy.get("energyCost")
+                if isinstance(energy, dict)
+                else None
+            )
+            # Empty sockets and zero-cost armor plugs commonly omit the
+            # energyCost object entirely in the manifest.
+            return (
+                int(cost)
+                if isinstance(cost, int) and not isinstance(cost, bool)
+                else 0
+            )
+
+        for instance_id, item_changes in armor_by_item.items():
+            # Old snapshots or focused unit callers may not include instance
+            # energy. In that case preserve correctness by using one direct
+            # stage; normal live previews always include ItemInstances.
+            if instance_id not in energy_by_item:
+                immediate.extend(item_changes)
+                continue
+            capacity, used = energy_by_item[instance_id]
+            plugs = current_by_item[instance_id]
+            reductions: list[dict[str, Any]] = []
+            increases: list[dict[str, Any]] = []
+            total_delta = 0
+            positive_delta = 0
+            target_indexes = {
+                int(change["socket_index"]) for change in item_changes
+            }
+            for change in item_changes:
+                socket_index = int(change["socket_index"])
+                current_hash = (
+                    plugs[socket_index]
+                    if socket_index < len(plugs)
+                    else None
+                )
+                current_cost = energy_cost(current_hash)
+                target_cost = energy_cost(int(change["plug_hash"]))
+                if current_cost is None or target_cost is None:
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} socket "
+                        f"{socket_index + 1} has unresolved armor energy "
+                        "metadata; no socket write was sent."
+                    )
+                delta = target_cost - current_cost
+                total_delta += delta
+                positive_delta += max(0, delta)
+                (reductions if delta <= 0 else increases).append(change)
+
+            required_reduction = max(0, used + total_delta - capacity)
+            selected_clears: list[dict[str, Any]] = []
+            if required_reduction:
+                candidates: list[tuple[int, dict[str, Any]]] = []
+                for clear in clear_candidates:
+                    if (
+                        str(clear["item_instance_id"]) != instance_id
+                        or int(clear["socket_index"]) in target_indexes
+                    ):
+                        continue
+                    socket_index = int(clear["socket_index"])
+                    current_hash = (
+                        plugs[socket_index]
+                        if socket_index < len(plugs)
+                        else None
+                    )
+                    current_cost = energy_cost(current_hash)
+                    if current_cost:
+                        candidates.append((current_cost, clear))
+                candidates.sort(
+                    key=lambda row: (
+                        -row[0], int(row[1]["socket_index"])
+                    )
+                )
+                released = 0
+                for cost, clear in candidates:
+                    selected_clears.append(clear)
+                    released += cost
+                    if released >= required_reduction:
+                        break
+                if released < required_reduction:
+                    name = str(item_changes[0]["item_name"])
+                    raise LoadoutOperationError(
+                        f"{name}'s planned armor mods use more energy than "
+                        "the item can safely support."
+                    )
+            immediate.extend(selected_clears)
+            if not selected_clears and used + positive_delta <= capacity:
+                # Every increase fits even if it races ahead of a reduction,
+                # so all changes on this item remain safely parallel.
+                immediate.extend(item_changes)
+            else:
+                immediate.extend(reductions)
+                deferred.extend(increases)
+
+        waves = []
+        if immediate:
+            waves.append(immediate)
+        if deferred:
+            waves.append(deferred)
+        return waves
+
     async def _prepare_loadout_wave(
         self,
         owner: str,
@@ -1659,40 +2429,14 @@ class LoadoutSyncService:
         expected_items: list[dict[str, Any]],
         socket_clears: list[dict[str, Any]],
         socket_changes: list[dict[str, Any]],
+        *,
+        defer_verification: bool = False,
     ) -> dict[str, Any]:
         """Converge equipment and sockets using maximum independent writes."""
 
         latest_source = source
         item_ids = [str(item["item_instance_id"]) for item in expected_items]
         last_errors: list[str] = []
-        initial_socket_pending = self._pending_socket_changes(
-            latest_source, socket_changes
-        )
-        armor_items_to_rebuild = {
-            str(change["item_instance_id"])
-            for change in initial_socket_pending
-            if change.get("socket_kind") == "armor mod"
-        }
-        required_clears = [
-            change
-            for change in socket_clears
-            if str(change["item_instance_id"]) in armor_items_to_rebuild
-        ]
-        if required_clears:
-            LOGGER.info(
-                "Clearing %s armor socket(s) before parallel insertion",
-                len(required_clears),
-            )
-            await self._apply_socket_wave(
-                owner,
-                access_token,
-                latest_source,
-                character_id,
-                membership_type,
-                required_clears,
-            )
-            # _apply_socket_wave force-refreshes and verifies every empty plug.
-            latest_source = await self._available_source(owner, access_token)
         for wave_index in range(MAX_ACTION_ATTEMPTS):
             equipment_pending = not equipment_matches(
                 latest_source,
@@ -1715,10 +2459,49 @@ class LoadoutSyncService:
                     "throttle_seconds": 0,
                 }
 
+            for change in socket_pending:
+                item = item_by_instance(
+                    latest_source, str(change["item_instance_id"])
+                )
+                if item is None:
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} disappeared while preparing "
+                        "its sockets."
+                    )
+                if (
+                    item.get("character_id") != character_id
+                    or item.get("source_kind")
+                    not in {"character_inventory", "equipped"}
+                ):
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} is not on the target "
+                        "character."
+                    )
+                if self._free_socket_change(
+                    latest_source,
+                    item,
+                    character_id,
+                    socket_index=int(change["socket_index"]),
+                    plug_hash=int(change["plug_hash"]),
+                    item_name=str(change["item_name"]),
+                ) is None:
+                    raise LoadoutOperationError(
+                        f"{change['item_name']} socket "
+                        f"{int(change['socket_index']) + 1} is no longer "
+                        "reported as freely insertable."
+                    )
+
+            socket_waves = self._plan_socket_transition_waves(
+                latest_source,
+                socket_pending,
+                socket_clears,
+            )
+            first_socket_wave = socket_waves[0] if socket_waves else []
+            later_socket_waves = socket_waves[1:]
             coroutines = []
             labels: list[str] = []
 
-            for change in socket_pending:
+            def append_socket(change: dict[str, Any]) -> None:
                 item_id = str(change["item_instance_id"])
                 item = item_by_instance(latest_source, item_id)
                 if item is None:
@@ -1762,6 +2545,9 @@ class LoadoutSyncService:
                     )
                 )
 
+            for change in first_socket_wave:
+                append_socket(change)
+
             if equipment_pending:
                 for item_id in item_ids:
                     item = item_by_instance(latest_source, item_id)
@@ -1799,12 +2585,14 @@ class LoadoutSyncService:
                 )
 
             LOGGER.info(
-                "Parallel preparation wave %s/%s submitted %s write(s): "
-                "%s socket target(s), equipment=%s",
+                "Parallel preparation wave %s/%s submitted %s first-stage "
+                "write(s): %s socket target(s), %s dependent socket "
+                "stage(s), equipment=%s",
                 wave_index + 1,
                 MAX_ACTION_ATTEMPTS,
                 len(coroutines),
-                len(socket_pending),
+                len(first_socket_wave),
+                len(later_socket_waves),
                 equipment_pending,
             )
             write_started_at = utc_now()
@@ -1822,7 +2610,61 @@ class LoadoutSyncService:
                     throttle = max(
                         throttle, float(result["throttle_seconds"])
                     )
+            # Cost-reducing armor changes must complete before a dependent
+            # cost increase. Successful action responses are authoritative;
+            # a failed prerequisite is left for the targeted retry cycle and
+            # prevents unsafe dependent writes in this cycle.
+            prerequisite_failed = any(
+                isinstance(result, Exception)
+                for result in results[:len(first_socket_wave)]
+            )
+            if not prerequisite_failed:
+                for socket_stage in later_socket_waves:
+                    stage_coroutines = []
+                    stage_labels = []
+                    for change in socket_stage:
+                        item_id = str(change["item_instance_id"])
+                        stage_labels.append(
+                            f"socket {item_id}:{int(change['socket_index'])}"
+                        )
+                        stage_coroutines.append(
+                            self.bungie.insert_socket_plug_free(
+                                access_token,
+                                item_instance_id=item_id,
+                                socket_index=int(change["socket_index"]),
+                                plug_hash=int(change["plug_hash"]),
+                                character_id=character_id,
+                                membership_type=membership_type,
+                            )
+                        )
+                    stage_results = await asyncio.gather(
+                        *stage_coroutines, return_exceptions=True
+                    )
+                    for label, result in zip(
+                        stage_labels, stage_results, strict=True
+                    ):
+                        if isinstance(result, BungieAuthenticationRejected):
+                            raise result
+                        if isinstance(result, Exception):
+                            last_errors.append(f"{label}: {result}")
+                        else:
+                            throttle = max(
+                                throttle,
+                                float(result["throttle_seconds"]),
+                            )
             await asyncio.sleep(max(EQUIP_INTERVAL, SOCKET_INTERVAL, throttle))
+            if defer_verification and not last_errors:
+                return {
+                    "message": (
+                        "Bungie accepted the planned equipment and socket "
+                        "waves; the following loadout snapshot will verify "
+                        "their combined final state."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": throttle,
+                }
             # Get evidence minted after this wave began. Bungie's profile
             # endpoint can return HTTP 200 with an older cached component;
             # treating that response as current made us replay successful
@@ -1886,33 +2728,17 @@ class LoadoutSyncService:
                     ),
                 )
             if not remaining_equipment and not remaining_sockets:
-                # Require a second observation so a briefly successful
-                # concurrent mutation cannot be snapshotted before Bungie's
-                # eventual item state settles.
-                await asyncio.sleep(SOCKET_INTERVAL)
-                settled_source = await self._fresh_source(owner, access_token)
-                settled_sockets = self._pending_socket_changes(
-                    settled_source, socket_changes
-                )
-                settled_equipment = not equipment_matches(
-                    settled_source,
-                    character_id,
-                    expected_items,
-                    compare_plugs=False,
-                )
-                if not settled_equipment and not settled_sockets:
-                    return {
-                        "message": (
-                            "Exact equipment and all saved sockets verified "
-                            "twice after "
-                            f"{wave_index + 1} parallel wave(s)."
-                        ),
-                        "http_status": 200,
-                        "error_code": 1,
-                        "error_status": "Success",
-                        "throttle_seconds": throttle,
-                    }
-                latest_source = settled_source
+                return {
+                    "message": (
+                        "Exact equipment and all saved sockets verified "
+                        "after "
+                        f"{wave_index + 1} parallel wave(s)."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": throttle,
+                }
             if wave_index + 1 < MAX_ACTION_ATTEMPTS:
                 await asyncio.sleep(RETRY_DELAYS[wave_index])
 
@@ -2449,9 +3275,24 @@ class LoadoutSyncService:
                 "icon_hash": valid_hash(current_slot.get("iconHash")),
                 "color_hash": valid_hash(current_slot.get("colorHash")),
             }
+        already_correct = slot_already_correct(
+            current_slot,
+            expected_items,
+            identifiers,
+            partial=partial,
+            expected_item_count=len(loadout["items"]),
+        )
+        if already_correct:
+            # This exact revision is already stored in the destination slot.
+            # No item movement or character mutation is needed to save it.
+            blockers = []
+            transfers = []
+            socket_clears = []
+            socket_changes = []
         return (
             {
                 "kind": "replace",
+                "already_correct": already_correct,
                 "slot_index": slot_index,
                 "display_index": slot_index + 1,
                 "encounter": (
@@ -2549,6 +3390,7 @@ class LoadoutSyncService:
                     ] = item
         blockers = []
         evacuations: list[dict[str, Any]] = []
+        early_cleanup_to_vault: list[dict[str, Any]] = []
         cleanup_to_vault: list[dict[str, Any]] = []
         non_desired_carried: dict[int, list[dict[str, Any]]] = {
             bucket: [
@@ -2611,7 +3453,7 @@ class LoadoutSyncService:
             evacuated_ids = {
                 row["item_instance_id"] for row in evacuations
             }
-            cleanup_to_vault.extend(
+            early_cleanup_to_vault.extend(
                 {
                     "item_instance_id": str(item["item_instance_id"]),
                     "item_hash": int(item["item_hash"]),
@@ -2768,6 +3610,7 @@ class LoadoutSyncService:
                 ]
                 candidates.sort(
                     key=lambda instance_id: (
+                        return_after_job[instance_id],
                         (item_by_instance(source, instance_id) or {}).get(
                             "source_kind"
                         ) != "vault",
@@ -2870,9 +3713,9 @@ class LoadoutSyncService:
             evacuated_ids = {
                 row["item_instance_id"] for row in evacuations
             }
-            cleanup_to_vault = [
+            early_cleanup_to_vault = [
                 row
-                for row in cleanup_to_vault
+                for row in early_cleanup_to_vault
                 if row["item_instance_id"] not in evacuated_ids
             ]
         retained_original_vault_items = {
@@ -2890,11 +3733,13 @@ class LoadoutSyncService:
         }
         final_vault_delta = (
             len(evacuations)
+            + len(early_cleanup_to_vault)
             + len(cleanup_to_vault)
             + len(returned_non_vault_items)
             - len(retained_original_vault_items)
         )
         vault_offloads: list[dict[str, Any]] = []
+        inventory_pipeline: list[dict[str, Any]] = []
         if retain_only_desired:
             required_vault_space = max(
                 len(evacuations) + bool(cross_character_to_vault),
@@ -2915,10 +3760,38 @@ class LoadoutSyncService:
                     f"character, but only {len(vault_offloads)} safe slot(s) "
                     "are available."
                 )
+            # Consume existing vault space first. Once it is exhausted,
+            # alternate a vault offload with a carried cleanup so the same
+            # capacity is reused inside a full transfer wave.
+            immediate_count = min(
+                available_vault, len(early_cleanup_to_vault)
+            )
+            immediate_cleanup = early_cleanup_to_vault[:immediate_count]
+            remaining_cleanup = early_cleanup_to_vault[immediate_count:]
+            pair_count = min(len(vault_offloads), len(remaining_cleanup))
+            inventory_pipeline.extend(
+                {**row, "direction": "to_vault"}
+                for row in immediate_cleanup
+            )
+            for offload, cleanup in zip(
+                vault_offloads[:pair_count],
+                remaining_cleanup[:pair_count],
+                strict=True,
+            ):
+                inventory_pipeline.extend(
+                    (
+                        {**offload, "direction": "from_vault"},
+                        {**cleanup, "direction": "to_vault"},
+                    )
+                )
+            vault_offloads = vault_offloads[pair_count:]
+            early_cleanup_to_vault = []
+            cleanup_to_vault.extend(remaining_cleanup[pair_count:])
         replace_jobs = [job for job in slot_jobs if job["kind"] == "replace"]
         if replace_jobs:
             replace_jobs[0]["capacity_staging"] = {
                 "vault_offloads": vault_offloads,
+                "inventory_pipeline": inventory_pipeline,
                 "preloads": preloads,
                 "evacuations": evacuations,
                 "return_to_vault": [
@@ -2931,6 +3804,7 @@ class LoadoutSyncService:
                     for instance_id, item in bucket.items()
                 ] if not retain_only_desired else [],
                 "restorations": evacuations if not retain_only_desired else [],
+                "early_cleanup_to_vault": early_cleanup_to_vault,
                 "cleanup_to_vault": cleanup_to_vault,
                 "retain_only_desired": retain_only_desired,
             }
@@ -3114,6 +3988,133 @@ class LoadoutSyncService:
             "or offline before confirming."
         ]
 
+    def _optimized_set_job_order(
+        self,
+        source: dict[str, Any],
+        character_id: str,
+        slot_jobs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Order set writes to maximize gear overlap while preserving slots."""
+
+        clears = [job for job in slot_jobs if job["kind"] == "clear"]
+        unchanged = [
+            job
+            for job in slot_jobs
+            if job["kind"] == "replace" and job.get("already_correct")
+        ]
+        pending = [
+            job
+            for job in slot_jobs
+            if job["kind"] == "replace" and not job.get("already_correct")
+        ]
+        if len(pending) < 2:
+            return [*clears, *pending, *unchanged]
+        terminal = max(pending, key=lambda job: int(job["slot_index"]))
+
+        def signature(job: dict[str, Any]) -> tuple[Any, ...]:
+            return tuple(
+                (
+                    str(item["item_instance_id"]),
+                    tuple(
+                        (
+                            int(plug["socket_index"]),
+                            plug.get("plug_hash"),
+                            bool(plug.get("filtered")),
+                        )
+                        for plug in item.get("plugs", [])
+                    ),
+                )
+                for item in job["items"]
+            )
+
+        grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for job in pending:
+            grouped.setdefault(signature(job), []).append(job)
+        terminal_signature = signature(terminal)
+        candidates = [
+            (job_signature, jobs)
+            for job_signature, jobs in grouped.items()
+            if job_signature != terminal_signature
+        ]
+        equipped = {
+            str(item["item_instance_id"])
+            for item in source["items"]
+            if item.get("source_kind") == "equipped"
+            and str(item.get("character_id")) == character_id
+        }
+        resident = {
+            str(item["item_instance_id"])
+            for item in source["items"]
+            if item.get("source_kind")
+            in {"equipped", "character_inventory"}
+            and str(item.get("character_id")) == character_id
+        }
+        carried_counts: dict[int, int] = {}
+        for item in source["items"]:
+            if (
+                item.get("source_kind") != "character_inventory"
+                or str(item.get("character_id")) != character_id
+            ):
+                continue
+            bucket = item.get("bucket_hash")
+            if bucket is not None:
+                bucket = int(bucket)
+                carried_counts[bucket] = carried_counts.get(bucket, 0) + 1
+        desired_by_bucket: dict[int, set[str]] = {}
+        for job in pending:
+            for item in job["items"]:
+                bucket = item.get("bucket_hash")
+                if bucket is not None:
+                    desired_by_bucket.setdefault(int(bucket), set()).add(
+                        str(item["item_instance_id"])
+                    )
+        constrained_buckets = {
+            bucket
+            for bucket, instance_ids in desired_by_bucket.items()
+            if carried_counts.get(bucket, 0) >= CHARACTER_BUCKET_CAPACITY
+            and any(instance_id not in resident for instance_id in instance_ids)
+        }
+
+        def constrained_arrivals(job: dict[str, Any]) -> int:
+            return sum(
+                int(item["bucket_hash"]) in constrained_buckets
+                and str(item["item_instance_id"]) not in resident
+                for item in job["items"]
+                if item.get("bucket_hash") is not None
+            )
+
+        ordered: list[dict[str, Any]] = []
+        while candidates:
+            best_signature, best_jobs = max(
+                candidates,
+                key=lambda group: (
+                    -constrained_arrivals(group[1][0]),
+                    len(
+                        equipped
+                        & {
+                            str(item["item_instance_id"])
+                            for item in group[1][0]["items"]
+                        }
+                    ),
+                    -min(int(job["slot_index"]) for job in group[1]),
+                ),
+            )
+            candidates.remove((best_signature, best_jobs))
+            ordered.extend(
+                sorted(best_jobs, key=lambda job: int(job["slot_index"]))
+            )
+            equipped = {
+                str(item["item_instance_id"])
+                for item in best_jobs[0]["items"]
+            }
+        ordered.extend(
+            sorted(
+                grouped[terminal_signature],
+                key=lambda job: int(job["slot_index"]),
+            )
+        )
+        return [*clears, *ordered, *unchanged]
+
     def _finalize_action_plan(
         self,
         source: dict[str, Any],
@@ -3133,126 +4134,214 @@ class LoadoutSyncService:
             ),
             {
                 "vault_offloads": [],
+                "inventory_pipeline": [],
                 "preloads": [],
                 "evacuations": [],
                 "return_to_vault": [],
                 "restorations": [],
+                "early_cleanup_to_vault": [],
                 "cleanup_to_vault": [],
                 "retain_only_desired": False,
             },
         )
-        for offload in capacity_staging["vault_offloads"]:
+
+        def append_transfer_waves(
+            direction: str,
+            phase: str,
+            transfers: list[dict[str, Any]],
+            *,
+            common: dict[str, Any] | None = None,
+        ) -> None:
+            if not transfers:
+                return
             actions.append(
                 {
-                    "action_type": "transfer_from_vault",
-                    "phase": (
-                        "Using spare inventory on another character to make "
-                        "vault space"
+                    "action_type": (
+                        "transfer_to_vault"
+                        if direction == "to_vault"
+                        else "transfer_from_vault"
                     ),
-                    "item_instance_id": offload["item_instance_id"],
+                    "phase": f"{phase} ({len(transfers)} items)",
+                    **(common or {}),
                     "request": {
-                        **offload,
-                        "mode": "vault_capacity_offload",
+                        "mode": "parallel_transfer",
+                        "transfers": transfers,
+                        "wave_size": TRANSFER_WAVE_SIZE,
                     },
-                    "expected": {},
+                    "expected": {
+                        "item_instance_ids": [
+                            str(row["item_instance_id"])
+                            for row in transfers
+                        ]
+                    },
                 }
             )
-        for preload in capacity_staging["preloads"]:
+        clear_slots = [
+            int(job["slot_index"])
+            for job in slot_jobs
+            if job["kind"] == "clear" and not job.get("already_correct")
+        ]
+        if clear_slots:
             actions.append(
                 {
-                    "action_type": "transfer_from_vault",
-                    "phase": "Preloading a set item to make vault space",
-                    "item_instance_id": preload["item_instance_id"],
-                    "request": preload,
-                    "expected": {},
+                    "action_type": "clear_slot",
+                    "phase": "Clearing all unassigned loadout slots",
+                    "request": {
+                        "mode": "parallel_clear",
+                        "slot_indexes": clear_slots,
+                    },
+                    "expected": {"slot_indexes": clear_slots},
                 }
             )
-        for staged in capacity_staging["evacuations"]:
+        if capacity_staging.get("inventory_pipeline"):
+            pipeline = capacity_staging["inventory_pipeline"]
             actions.append(
                 {
                     "action_type": "transfer_to_vault",
                     "phase": (
-                        "Making temporary character inventory space"
-                        + (
-                            f": {staged['item_name']}"
-                            if staged.get("item_name")
-                            else ""
-                        )
+                        "Pipelining vault capacity and carried gear cleanup "
+                        f"({len(pipeline)} moves)"
                     ),
-                    "item_instance_id": staged["item_instance_id"],
-                    "request": {**staged, "mode": "capacity_stage"},
-                    "expected": {},
+                    "request": {
+                        "mode": "inventory_pipeline",
+                        "transfers": pipeline,
+                        "wave_size": TRANSFER_WAVE_SIZE,
+                    },
+                    "expected": {
+                        "item_instance_ids": [
+                            str(row["item_instance_id"])
+                            for row in pipeline
+                        ]
+                    },
                 }
             )
+        append_transfer_waves(
+            "from_vault",
+            "Making vault space on other characters",
+            capacity_staging["vault_offloads"],
+        )
+        append_transfer_waves(
+            "to_vault",
+            "Moving carried non-set gear to the vault",
+            capacity_staging.get("early_cleanup_to_vault", []),
+        )
+        append_transfer_waves(
+            "from_vault",
+            "Preloading set items",
+            capacity_staging["preloads"],
+        )
+        append_transfer_waves(
+            "to_vault",
+            "Making temporary character inventory space",
+            [
+                {**staged, "mode": "capacity_stage"}
+                for staged in capacity_staging["evacuations"]
+            ],
+        )
+        prepared_signature: tuple[Any, ...] | None = None
         for job in slot_jobs:
             encounter_id = (job.get("encounter") or {}).get("id")
             assignment_id = (job.get("assignment") or {}).get("id")
             slot = int(job["slot_index"])
+            if job.get("already_correct"):
+                continue
             if job["kind"] == "clear":
-                actions.extend(
-                    [
-                        action("clear_slot", "Clearing unassigned slot", slot=slot),
-                        action("verify_clear", "Verifying empty slot", slot=slot),
-                    ]
-                )
                 continue
             common = {"encounter_id": encounter_id, "assignment_id": assignment_id, "target_slot_index": slot}
-            for transfer in job["transfers"]:
-                direction = transfer["direction"]
+            item_ids = [item["item_instance_id"] for item in job["items"]]
+            signature = tuple(
+                (
+                    str(item["item_instance_id"]),
+                    tuple(
+                        (
+                            int(plug["socket_index"]),
+                            plug.get("plug_hash"),
+                            bool(plug.get("filtered")),
+                        )
+                        for plug in item.get("plugs", [])
+                    ),
+                )
+                for item in job["items"]
+            )
+            job_transfers: dict[str, list[dict[str, Any]]] = {
+                "to_vault": [],
+                "from_vault": [],
+            }
+            for transfer in (
+                [] if signature == prepared_signature else job["transfers"]
+            ):
+                direction = str(transfer["direction"])
+                job_transfers[direction].append(transfer)
+            append_transfer_waves(
+                "to_vault",
+                "Preparing exact items",
+                job_transfers["to_vault"],
+                common=common,
+            )
+            append_transfer_waves(
+                "from_vault",
+                "Preparing exact items",
+                job_transfers["from_vault"],
+                common=common,
+            )
+            if signature != prepared_signature:
                 actions.append(
                     {
-                        "action_type": "transfer_to_vault" if direction == "to_vault" else "transfer_from_vault",
-                        "phase": "Preparing exact items",
+                        "action_type": "equip",
+                        "phase": (
+                            "Preparing all equipment and sockets in parallel"
+                        ),
                         **common,
-                        "item_instance_id": transfer["item_instance_id"],
-                        "request": transfer,
-                        "expected": {},
+                        "request": {
+                            "mode": "parallel_prepare",
+                            "item_instance_ids": item_ids,
+                            "socket_clears": job.get("socket_clears", []),
+                            "socket_changes": job["socket_changes"],
+                            "verify_with_snapshot": True,
+                        },
+                        "expected": {"items": job["items"]},
                     }
                 )
-            item_ids = [item["item_instance_id"] for item in job["items"]]
-            actions.append(
-                {
-                    "action_type": "equip",
-                    "phase": (
-                        "Preparing all equipment and sockets in parallel"
-                    ),
-                    **common,
-                    "request": {
-                        "mode": "parallel_prepare",
-                        "item_instance_ids": item_ids,
-                        "socket_clears": job.get("socket_clears", []),
-                        "socket_changes": job["socket_changes"],
-                    },
-                    "expected": {"items": job["items"]},
-                }
-            )
+                prepared_signature = signature
             actions.extend(
                 [
-                    {"action_type": "snapshot", "phase": "Snapshotting selected slot", **common, "request": job["identifiers"], "expected": {"items": job["items"], "partial": bool(job.get("partial"))}},
+                    {
+                        "action_type": "snapshot",
+                        "phase": "Saving and verifying selected slot",
+                        **common,
+                        "request": {
+                            **job["identifiers"],
+                            "mode": "snapshot_verify",
+                            "item_instance_ids": item_ids,
+                            "socket_clears": job.get("socket_clears", []),
+                            "socket_changes": job["socket_changes"],
+                        },
+                        "expected": {
+                            "items": job["items"],
+                            "partial": bool(job.get("partial")),
+                            "identifiers": (
+                                job["identifiers"]
+                                if any(job["identifiers"].values())
+                                else {}
+                            ),
+                        },
+                    },
                 ]
             )
-            if any(job["identifiers"].values()):
-                actions.append(
-                    {"action_type": "identifiers", "phase": "Applying slot identifiers", **common, "request": {}, "expected": job["identifiers"]}
-                )
-            actions.append(
-                {"action_type": "verify_slot", "phase": "Verifying in-game slot", **common, "request": {}, "expected": {"items": job["items"], "partial": bool(job.get("partial")), "identifiers": job["identifiers"] if any(job["identifiers"].values()) else {}}}
+            append_transfer_waves(
+                "to_vault",
+                "Returning completed set items to the vault",
+                job.get("post_snapshot_vault_returns", []),
+                common=common,
             )
-            for returned in job.get("post_snapshot_vault_returns", []):
-                actions.append(
-                    {
-                        "action_type": "transfer_to_vault",
-                        "phase": "Returning a completed set item to the vault",
-                        **common,
-                        "item_instance_id": returned["item_instance_id"],
-                        "request": {
-                            **returned,
-                            "mode": "restore_vault_origin",
-                        },
-                        "expected": {},
-                    }
-                )
-        if not capacity_staging["retain_only_desired"]:
+        if (
+            not capacity_staging["retain_only_desired"]
+            and any(
+                job["kind"] == "replace"
+                and not job.get("already_correct")
+                for job in slot_jobs
+            )
+        ):
             restore_ids = [
                 item["item_instance_id"] for item in original["items"]
             ]
@@ -3291,34 +4380,38 @@ class LoadoutSyncService:
                     {"action_type": "verify_restored", "phase": "Verifying restored equipment", "request": {}, "expected": {"items": original["items"]}},
                 ]
             )
-        for cleanup in capacity_staging["cleanup_to_vault"]:
-            actions.append(
+        append_transfer_waves(
+            "to_vault",
+            "Moving displaced non-set gear to the vault",
+            capacity_staging["cleanup_to_vault"],
+        )
+        append_transfer_waves(
+            "to_vault",
+            "Returning loadout items to their original vault location",
+            capacity_staging["return_to_vault"],
+        )
+        append_transfer_waves(
+            "from_vault",
+            "Restoring temporary inventory staging",
+            capacity_staging["restorations"],
+        )
+        if capacity_staging["retain_only_desired"]:
+            desired_item_ids = sorted(
                 {
-                    "action_type": "transfer_to_vault",
-                    "phase": "Moving non-set gameplay item to the vault",
-                    "item_instance_id": cleanup["item_instance_id"],
-                    "request": {**cleanup, "mode": "retain_set_only"},
-                    "expected": {},
+                    str(item["item_instance_id"])
+                    for job in slot_jobs
+                    if job["kind"] == "replace"
+                    for item in job["items"]
                 }
             )
-        for returned in capacity_staging["return_to_vault"]:
             actions.append(
                 {
-                    "action_type": "transfer_to_vault",
-                    "phase": "Returning loadout item to its original vault location",
-                    "item_instance_id": returned["item_instance_id"],
-                    "request": {**returned, "mode": "restore_vault_origin"},
-                    "expected": {},
-                }
-            )
-        for restored in capacity_staging["restorations"]:
-            actions.append(
-                {
-                    "action_type": "transfer_from_vault",
-                    "phase": "Restoring temporary character inventory staging",
-                    "item_instance_id": restored["item_instance_id"],
-                    "request": restored,
-                    "expected": {},
+                    "action_type": "cleanup_inventory",
+                    "phase": "Verifying final set-only character inventory",
+                    "request": {"mode": "cleanup_non_set"},
+                    "expected": {
+                        "desired_item_instance_ids": desired_item_ids,
+                    },
                 }
             )
         write_types = {
@@ -3330,26 +4423,92 @@ class LoadoutSyncService:
             "clear_slot",
             "restore_equipment",
             "insert_socket_plug",
+            "cleanup_inventory",
         }
-        write_count = sum(row["action_type"] in write_types for row in actions)
-        read_count = sum(row["action_type"] not in write_types for row in actions) + write_count
+        def underlying_write_count(row: dict[str, Any]) -> int:
+            request = row.get("request", {})
+            if request.get("mode") in {
+                "parallel_transfer",
+                "inventory_pipeline",
+            }:
+                return len(request.get("transfers", []))
+            if request.get("mode") == "parallel_clear":
+                return len(request.get("slot_indexes", []))
+            if request.get("mode") == "parallel_prepare":
+                return (
+                    1
+                    + len(request.get("socket_changes", []))
+                )
+            return int(row["action_type"] in write_types)
+
+        write_count = sum(underlying_write_count(row) for row in actions)
+        read_count = len(actions)
         minimum = sum(
-            TRANSFER_INTERVAL if row["action_type"].startswith("transfer_") else EQUIP_INTERVAL if row["action_type"] in {"equip", "restore_equipment"} else SOCKET_INTERVAL if row["action_type"] == "insert_socket_plug" else LOADOUT_INTERVAL if row["action_type"] in {"snapshot", "identifiers", "clear_slot"} else 0
+            (
+                len(row.get("request", {}).get("transfers", []))
+                * TRANSFER_INTERVAL
+                if row.get("request", {}).get("mode")
+                in {"parallel_transfer", "inventory_pipeline"}
+                else len(row.get("request", {}).get("slot_indexes", []))
+                * CLEAR_LOADOUT_INTERVAL
+                if row.get("request", {}).get("mode") == "parallel_clear"
+                else TRANSFER_INTERVAL
+                if row["action_type"].startswith("transfer_")
+                else EQUIP_INTERVAL
+                if row["action_type"] in {"equip", "restore_equipment"}
+                else SOCKET_INTERVAL
+                if row["action_type"] == "insert_socket_plug"
+                else LOADOUT_INTERVAL
+                if row["action_type"]
+                in {"snapshot", "identifiers", "clear_slot"}
+                else 0
+            )
             for row in actions
         )
+        speed_summary = {
+            "durable_checkpoints": len(actions),
+            "transfer_items": sum(
+                len(row.get("request", {}).get("transfers", []))
+                for row in actions
+                if row.get("request", {}).get("mode")
+                in {"parallel_transfer", "inventory_pipeline"}
+            ),
+            "transfer_waves": sum(
+                (
+                    len(row.get("request", {}).get("transfers", []))
+                    + TRANSFER_WAVE_SIZE
+                    - 1
+                )
+                // TRANSFER_WAVE_SIZE
+                for row in actions
+                if row.get("request", {}).get("mode")
+                in {"parallel_transfer", "inventory_pipeline"}
+            ),
+            "clear_slots": len(clear_slots),
+            "unique_preparations": sum(
+                row.get("request", {}).get("mode") == "parallel_prepare"
+                for row in actions
+            ),
+            "estimated_seconds": round(
+                sum(estimated_action_duration(row) for row in actions)
+            ),
+        }
         return {
             "title": title,
             "activity_name": activity_name,
             "target_character_id": str(character["character_id"]),
             "target_character_name": CLASS_NAMES.get(character.get("class_type"), "Guardian"),
             "slot_capacity": len(source["profile"].get("characterLoadouts", {}).get("data", {}).get(str(character["character_id"]), {}).get("loadouts", [])),
-            "slot_jobs": slot_jobs,
+            "slot_jobs": sorted(
+                slot_jobs, key=lambda job: int(job["slot_index"])
+            ),
             "original_equipment": original["items"],
             "actions": actions,
             "write_request_count": write_count,
             "read_request_count": read_count,
             "request_count": write_count + read_count,
             "minimum_throttle_seconds": round(minimum, 1),
+            "speed_summary": speed_summary,
             "eligibility": "Character must be in orbit, a social space, or offline.",
             "inventory_policy": (
                 "set_items_only"
@@ -4085,6 +5244,23 @@ def identifiers_match(slot: dict[str, Any], expected: dict[str, Any]) -> bool:
     )
 
 
+def slot_already_correct(
+    slot: dict[str, Any],
+    expected_items: list[dict[str, Any]],
+    identifiers: dict[str, Any],
+    *,
+    partial: bool,
+    expected_item_count: int,
+) -> bool:
+    """Confirm that saving this revision would make no slot-level change."""
+
+    return (
+        len(expected_items) == expected_item_count
+        and slot_matches(slot, expected_items, allow_extra=partial)
+        and identifiers_match(slot, identifiers)
+    )
+
+
 def summarize_slot(slot: dict[str, Any]) -> dict[str, Any]:
     items = slot.get("items") if isinstance(slot, dict) else []
     return {
@@ -4121,6 +5297,144 @@ def parse_api_timestamp(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def action_timing_key(action: dict[str, Any]) -> str:
+    action_type = str(action.get("action_type") or "")
+    request = action.get("request")
+    mode = request.get("mode") if isinstance(request, dict) else None
+    specialized = f"{action_type}:{mode}" if mode else action_type
+    return (
+        specialized
+        if specialized in ACTION_DURATION_DEFAULTS
+        else action_type
+    )
+
+
+def estimated_action_duration(action: dict[str, Any]) -> float:
+    """Estimate a checkpoint while accounting for grouped request counts."""
+
+    key = action_timing_key(action)
+    request = action.get("request")
+    request = request if isinstance(request, dict) else {}
+    if key.endswith(":parallel_clear"):
+        return max(
+            4.0,
+            len(request.get("slot_indexes", [])) * CLEAR_LOADOUT_INTERVAL
+            + 6.0,
+        )
+    if key.endswith(":parallel_transfer") or key.endswith(
+        ":inventory_pipeline"
+    ):
+        transfer_count = len(request.get("transfers", []))
+        waves = max(
+            1,
+            (transfer_count + TRANSFER_WAVE_SIZE - 1)
+            // TRANSFER_WAVE_SIZE,
+        )
+        return max(
+            4.0,
+            transfer_count * TRANSFER_INTERVAL + waves * 6.0,
+        )
+    if key.endswith(":parallel_prepare"):
+        # InsertSocketPlugFree is one plug per request and Bungie documents a
+        # 0.5-second per-user action interval. Clears are candidates selected
+        # locally only when required, not unconditional writes.
+        return max(
+            2.0,
+            len(request.get("socket_changes", [])) * SOCKET_INTERVAL + 2.0,
+        )
+    return ACTION_DURATION_DEFAULTS.get(key, 4.0)
+
+
+def operation_timing(
+    operation: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return wall-clock elapsed time and an adaptive checkpoint ETA."""
+
+    current_time = (now or datetime.now(UTC)).astimezone(UTC)
+    started_at = parse_api_timestamp(operation.get("started_at"))
+    terminal_at = parse_api_timestamp(
+        operation.get("completed_at") or operation.get("updated_at")
+    )
+    end_time = (
+        terminal_at
+        if operation.get("status") in {"completed", "failed", "paused"}
+        and terminal_at is not None
+        else current_time
+    )
+    elapsed_seconds = (
+        max(0, round((end_time - started_at).total_seconds()))
+        if started_at is not None
+        else 0
+    )
+
+    samples: dict[str, list[float]] = {}
+    all_samples: list[float] = []
+    for action in operation.get("actions", []):
+        action_started = parse_api_timestamp(action.get("started_at"))
+        action_completed = parse_api_timestamp(action.get("completed_at"))
+        if action_started is None or action_completed is None:
+            continue
+        duration = max(
+            0.1, (action_completed - action_started).total_seconds()
+        )
+        samples.setdefault(action_timing_key(action), []).append(duration)
+        all_samples.append(duration)
+
+    if operation.get("status") == "completed":
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "estimated_remaining_seconds": 0,
+            "eta_confidence": "complete",
+        }
+    if operation.get("status") in {"failed", "paused"}:
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "estimated_remaining_seconds": None,
+            "eta_confidence": "paused",
+        }
+
+    fallback = median(all_samples) if all_samples else None
+    remaining = 0.0
+    for action in operation.get("actions", []):
+        if action.get("status") in {"completed", "skipped"}:
+            continue
+        key = action_timing_key(action)
+        expected = (
+            median(samples[key])
+            if samples.get(key)
+            else (
+                estimated_action_duration(action)
+                if key in ACTION_DURATION_DEFAULTS
+                else fallback or estimated_action_duration(action)
+            )
+        )
+        action_started = parse_api_timestamp(action.get("started_at"))
+        if action.get("status") == "running" and action_started is not None:
+            running_for = max(
+                0.0, (current_time - action_started).total_seconds()
+            )
+            expected = (
+                expected - running_for
+                if running_for < expected
+                else max(1.0, running_for * 0.25)
+            )
+        remaining += expected
+
+    completed_sample_count = len(all_samples)
+    confidence = (
+        "high"
+        if completed_sample_count >= 10
+        else "medium" if completed_sample_count >= 3 else "low"
+    )
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "estimated_remaining_seconds": max(0, round(remaining)),
+        "eta_confidence": confidence,
+    }
 
 
 def error_evidence(error: Exception) -> tuple[int | None, int | None, str, str, float]:

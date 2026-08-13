@@ -6,6 +6,15 @@
   let lastStatus = root.dataset.operationStatus || '';
   let terminal = terminalStates.has(lastStatus);
   if (terminal) return;
+  const formatDuration = (value) => {
+    const total = Math.max(0, Math.round(Number(value) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    if (hours) return `${hours}h ${minutes}m`;
+    if (minutes) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+  };
   const poll = async () => {
     if (terminal || document.hidden) return;
     try {
@@ -18,6 +27,13 @@
       root.querySelector('[data-progress-bar]').style.width = `${state.progress_percent}%`;
       const retry = state.last_error ? ` · Retrying after: ${state.last_error}` : '';
       root.querySelector('[data-progress-copy]').textContent = `${state.progress_percent}% complete · ${state.attempts} attempt(s) on the current checkpoint${retry}.`;
+      root.querySelector('[data-progress-elapsed]').textContent = `Elapsed: ${formatDuration(state.elapsed_seconds)}`;
+      const eta = state.estimated_remaining_seconds;
+      root.querySelector('[data-progress-eta]').textContent = eta == null
+        ? 'ETA unavailable while stopped'
+        : state.status === 'completed'
+          ? 'Complete'
+          : `About ${formatDuration(eta)} remaining`;
       root.querySelector('.progress-track').setAttribute('aria-valuenow', state.progress_percent);
       if (terminalStates.has(state.status) && !terminalStates.has(lastStatus)) {
         terminal = true;
