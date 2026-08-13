@@ -33,6 +33,7 @@ from destiny_web_app.loadout_manager import (
     component_plug_hashes,
     intended_bucket_hash,
     snapshot_is_fresh,
+    raw_loadout_slot_empty,
     valid_hash,
     valid_instance_id,
 )
@@ -48,8 +49,13 @@ MAX_ACTION_ATTEMPTS = 3
 RETRY_DELAYS = (1.0, 2.0)
 POST_WRITE_REFRESH_DELAYS = (1.0, 2.0, 4.0, 8.0, 12.0, 18.0)
 PREPARATION_VERIFY_DELAYS = (1.0, 2.0, 4.0)
+TARGETED_VERIFY_DELAYS = (0.5, 1.0, 2.0, 4.0, 6.0)
 TRANSFER_INTERVAL = 0.1
-TRANSFER_WAVE_SIZE = 8
+# TransferItem accepts one item per HTTP request, but Bungie permits one
+# action every 0.1 seconds. Keep enough scheduled members in one wave to cover
+# a full character/vault cleanup, then pay for one live verification rather
+# than refreshing the profile after every small batch.
+TRANSFER_WAVE_SIZE = 128
 EQUIP_INTERVAL = 0.1
 SOCKET_INTERVAL = 0.5
 LOADOUT_INTERVAL = 1.0
@@ -112,6 +118,11 @@ class LoadoutSyncService:
         self.plans = plans
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._operation_tasks: dict[
+            tuple[str, str], asyncio.Task[None]
+        ] = {}
+        self._verification_latencies: dict[str, list[float]] = {}
+        self._prefetched_item_ids: set[str] = set()
         self._recover_interrupted()
 
     def create_single_preview(
@@ -324,8 +335,6 @@ class LoadoutSyncService:
         board = self.database.load_loadout_set(owner, set_id)
         if board is None:
             raise LoadoutPreviewError("The loadout set is unavailable.")
-        if not board["slots"]:
-            raise LoadoutPreviewError("An empty loadout set cannot be applied.")
         class_type = int(board["character_class_type"])
         characters = [
             row
@@ -588,7 +597,7 @@ class LoadoutSyncService:
                         updated_at = ?, completed_at = ?
                     WHERE bungie_membership_id = ?
                       AND target_character_id = ?
-                      AND status = 'paused'
+                      AND status IN ('pending', 'running', 'paused')
                     """,
                     (
                         now,
@@ -658,8 +667,27 @@ class LoadoutSyncService:
                     (now, preview_id, owner),
                 )
         except sqlite3.IntegrityError as error:
+            detail = str(error)
+            active_columns = (
+                "loadout_sync_operations.bungie_membership_id, "
+                "loadout_sync_operations.target_character_id"
+            )
+            if active_columns in detail:
+                raise LoadoutOperationError(
+                    "Another loadout operation is already active for this "
+                    "character."
+                ) from error
+            LOGGER.exception(
+                "Could not persist confirmed loadout operation %s",
+                operation_id,
+            )
+            if "loadout_sync_operations.preview_id" in detail:
+                raise LoadoutOperationError(
+                    "This preview was already confirmed. Create a fresh "
+                    "preview and try again."
+                ) from error
             raise LoadoutOperationError(
-                "Another loadout operation is already active for this character."
+                "The durable loadout action plan could not be saved."
             ) from error
         operation = self.operation(owner, operation_id)
         if operation is None:
@@ -813,19 +841,83 @@ class LoadoutSyncService:
             self._run(owner, operation_id, access_token, lock)
         )
         self._tasks.add(task)
+        self._operation_tasks[key] = task
         task.add_done_callback(
             lambda completed: self._operation_task_finished(
-                owner, operation_id, completed
+                owner, operation_id, key, completed
             )
         )
+
+    async def cancel_active_for_character(
+        self,
+        owner: str,
+        character_id: str,
+    ) -> None:
+        """Stop and supersede any durable operation before a new confirm."""
+
+        key = (owner, character_id)
+        task = self._operation_tasks.get(key)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        reason = "Superseded by a newly confirmed live preview."
+        now = as_iso(utc_now())
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active_ids = [
+                str(row["operation_id"])
+                for row in connection.execute(
+                    """
+                    SELECT operation_id FROM loadout_sync_operations
+                    WHERE bungie_membership_id = ?
+                      AND target_character_id = ?
+                      AND status IN ('pending', 'running', 'paused')
+                    """,
+                    (owner, character_id),
+                ).fetchall()
+            ]
+            for active_id in active_ids:
+                connection.execute(
+                    """
+                    UPDATE loadout_sync_action_attempts
+                    SET status = 'failed', message = ?, completed_at = ?
+                    WHERE operation_id = ? AND status = 'running'
+                    """,
+                    (reason, now, active_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE loadout_sync_actions
+                    SET status = 'failed', last_message = ?, completed_at = ?
+                    WHERE operation_id = ? AND status = 'running'
+                    """,
+                    (reason, now, active_id),
+                )
+            connection.execute(
+                """
+                UPDATE loadout_sync_operations
+                SET status = 'failed', last_error = ?, updated_at = ?,
+                    completed_at = ?
+                WHERE bungie_membership_id = ?
+                  AND target_character_id = ?
+                  AND status IN ('pending', 'running', 'paused')
+                """,
+                (reason, now, now, owner, character_id),
+            )
 
     def _operation_task_finished(
         self,
         owner: str,
         operation_id: str,
+        key: tuple[str, str],
         task: asyncio.Task[None],
     ) -> None:
         self._tasks.discard(task)
+        if self._operation_tasks.get(key) is task:
+            self._operation_tasks.pop(key, None)
         if task.cancelled():
             self._pause_interrupted_operation(
                 owner,
@@ -1576,11 +1668,12 @@ class LoadoutSyncService:
                 "error_status": "Success",
                 "throttle_seconds": 0,
             }
+            target_index = int(action["target_slot_index"])
+            prefetch_task: asyncio.Task[None] | None = None
             if not items_match:
-                write_started_at = utc_now()
                 result = await self.bungie.snapshot_loadout(
                     access_token,
-                    loadout_index=int(action["target_slot_index"]),
+                    loadout_index=target_index,
                     character_id=character_id,
                     membership_type=membership_type,
                     color_hash=valid_hash(request.get("color_hash")),
@@ -1590,30 +1683,51 @@ class LoadoutSyncService:
                 await asyncio.sleep(
                     max(LOADOUT_INTERVAL, result["throttle_seconds"])
                 )
-                latest_source = await self._fresh_source_after(
-                    owner, access_token, write_started_at
+                prefetched = self._safe_next_transfer_prefetch(
+                    operation, action, latest_source
                 )
-                for verification_delay in PREPARATION_VERIFY_DELAYS:
-                    current_slot = character_slot(
-                        latest_source,
-                        character_id,
-                        int(action["target_slot_index"]),
+                if prefetched:
+                    prefetch_task = asyncio.create_task(
+                        self._submit_transfer_prefetch(
+                            access_token,
+                            membership_type,
+                            prefetched,
+                        )
                     )
-                    if slot_matches(
-                        current_slot,
-                        expected["items"],
-                        allow_extra=bool(expected.get("partial")),
-                    ):
-                        break
-                    await asyncio.sleep(verification_delay)
+                targeted = await self._targeted_profile_until(
+                    access_token,
+                    latest_source,
+                    components=(206,),
+                    verification_kind="snapshot_loadout",
+                    predicate=lambda profile: (
+                        raw_character_loadout_slots(profile, character_id)
+                        is not None
+                        and slot_matches(
+                            raw_character_slot(
+                                profile, character_id, target_index
+                            ),
+                            expected["items"],
+                            allow_extra=bool(expected.get("partial")),
+                        )
+                    ),
+                )
+                if targeted:
+                    slot = raw_character_slot(
+                        targeted, character_id, target_index
+                    )
+                else:
                     latest_source = await self._fresh_source(
                         owner, access_token
                     )
-            slot = character_slot(
-                latest_source,
-                character_id,
-                int(action["target_slot_index"]),
-            )
+                    slot = character_slot(
+                        latest_source, character_id, target_index
+                    )
+                if prefetch_task is not None:
+                    await prefetch_task
+            else:
+                slot = character_slot(
+                    latest_source, character_id, target_index
+                )
             differences = slot_mismatch_reasons(
                 slot,
                 expected["items"],
@@ -1625,6 +1739,18 @@ class LoadoutSyncService:
                 # SnapshotLoadout. If that combined verification exposes a
                 # lagging or failed member, repair only the still-missing
                 # preparation targets and snapshot once more.
+                latest_source = await self._fresh_source(
+                    owner, access_token
+                )
+                slot = character_slot(
+                    latest_source, character_id, target_index
+                )
+                differences = slot_mismatch_reasons(
+                    slot,
+                    expected["items"],
+                    allow_extra=bool(expected.get("partial")),
+                )
+            if differences and request.get("socket_changes") is not None:
                 await self._prepare_loadout_wave(
                     owner,
                     access_token,
@@ -1635,10 +1761,9 @@ class LoadoutSyncService:
                     request.get("socket_clears", []),
                     request.get("socket_changes", []),
                 )
-                write_started_at = utc_now()
                 result = await self.bungie.snapshot_loadout(
                     access_token,
-                    loadout_index=int(action["target_slot_index"]),
+                    loadout_index=target_index,
                     character_id=character_id,
                     membership_type=membership_type,
                     color_hash=valid_hash(request.get("color_hash")),
@@ -1648,13 +1773,33 @@ class LoadoutSyncService:
                 await asyncio.sleep(
                     max(LOADOUT_INTERVAL, result["throttle_seconds"])
                 )
-                latest_source = await self._fresh_source_after(
-                    owner, access_token, write_started_at
-                )
-                slot = character_slot(
+                targeted = await self._targeted_profile_until(
+                    access_token,
                     latest_source,
-                    character_id,
-                    int(action["target_slot_index"]),
+                    components=(206,),
+                    verification_kind="snapshot_loadout",
+                    predicate=lambda profile: (
+                        raw_character_loadout_slots(profile, character_id)
+                        is not None
+                        and slot_matches(
+                            raw_character_slot(
+                                profile, character_id, target_index
+                            ),
+                            expected["items"],
+                            allow_extra=bool(expected.get("partial")),
+                        )
+                    ),
+                )
+                slot = (
+                    raw_character_slot(
+                        targeted, character_id, target_index
+                    )
+                    if targeted
+                    else character_slot(
+                        await self._fresh_source(owner, access_token),
+                        character_id,
+                        target_index,
+                    )
                 )
                 differences = slot_mismatch_reasons(
                     slot,
@@ -1669,11 +1814,10 @@ class LoadoutSyncService:
             if expected_identifiers and not identifiers_match(
                 slot, expected_identifiers
             ):
-                write_started_at = utc_now()
                 identifier_result = (
                     await self.bungie.update_loadout_identifiers(
                         access_token,
-                        loadout_index=int(action["target_slot_index"]),
+                        loadout_index=target_index,
                         character_id=character_id,
                         membership_type=membership_type,
                         name_hash=expected_identifiers.get("name_hash"),
@@ -1687,18 +1831,39 @@ class LoadoutSyncService:
                         identifier_result["throttle_seconds"],
                     )
                 )
-                latest_source = await self._fresh_source_after(
-                    owner, access_token, write_started_at
-                )
-                slot = character_slot(
+                targeted = await self._targeted_profile_until(
+                    access_token,
                     latest_source,
-                    character_id,
-                    int(action["target_slot_index"]),
+                    components=(206,),
+                    verification_kind="loadout_identifiers",
+                    predicate=lambda profile: (
+                        raw_character_loadout_slots(profile, character_id)
+                        is not None
+                        and identifiers_match(
+                            raw_character_slot(
+                                profile, character_id, target_index
+                            ),
+                            expected_identifiers,
+                        )
+                    ),
+                )
+                slot = (
+                    raw_character_slot(
+                        targeted, character_id, target_index
+                    )
+                    if targeted
+                    else character_slot(
+                        await self._fresh_source(owner, access_token),
+                        character_id,
+                        target_index,
+                    )
                 )
                 if not identifiers_match(slot, expected_identifiers):
                     raise LoadoutOperationError(
                         "The slot identifiers did not verify."
                     )
+            if getattr(self.bungie, "get_profile", None) is not None:
+                await self._fresh_source(owner, access_token)
             result["message"] = (
                 "In-game slot items and identifiers verified together."
             )
@@ -1802,14 +1967,23 @@ class LoadoutSyncService:
         pending = list(transfers)
         last_errors: list[str] = []
         throttle = 0.0
+        locations = {
+            str(item["item_instance_id"]): (
+                str(item.get("source_kind") or ""),
+                str(item.get("character_id"))
+                if item.get("character_id") is not None
+                else None,
+            )
+            for item in source["items"]
+            if item.get("item_instance_id")
+        }
 
         def transfer_complete(
-            current_source: dict[str, Any], transfer: dict[str, Any]
+            current_locations: dict[str, tuple[str, str | None]],
+            transfer: dict[str, Any],
         ) -> bool:
-            item = item_by_instance(
-                current_source, str(transfer["item_instance_id"])
-            )
-            if item is None:
+            location = current_locations.get(str(transfer["item_instance_id"]))
+            if location is None:
                 return False
             transfer_direction = (
                 str(transfer["direction"])
@@ -1817,18 +1991,41 @@ class LoadoutSyncService:
                 else direction
             )
             if transfer_direction == "to_vault":
-                return item.get("source_kind") == "vault"
+                return location[0] == "vault"
             return (
-                item.get("source_kind")
-                in {"character_inventory", "equipped"}
-                and str(item.get("character_id"))
+                location[0] in {"character_inventory", "equipped"}
+                and str(location[1])
                 == str(transfer["target_character_id"])
+            )
+
+        prefetched_ids = getattr(self, "_prefetched_item_ids", set())
+        prefetched = [
+            transfer
+            for transfer in pending
+            if str(transfer["item_instance_id"]) in prefetched_ids
+        ]
+        if prefetched:
+            targeted = await self._targeted_profile_until(
+                access_token,
+                latest_source,
+                components=(102, 201, 205),
+                verification_kind="prefetched_transfer",
+                predicate=lambda profile: all(
+                    transfer_complete(raw_item_locations(profile), transfer)
+                    for transfer in prefetched
+                ),
+            )
+            if targeted:
+                locations = raw_item_locations(targeted)
+            prefetched_ids.difference_update(
+                str(transfer["item_instance_id"])
+                for transfer in prefetched
             )
 
         queue = [
             transfer
             for transfer in pending
-            if not transfer_complete(latest_source, transfer)
+            if not transfer_complete(locations, transfer)
         ]
         if not queue:
             return {"message": "Every transfer in this wave was already complete."}
@@ -1848,10 +2045,8 @@ class LoadoutSyncService:
             ) -> dict[str, Any]:
                 if offset:
                     await asyncio.sleep(offset * TRANSFER_INTERVAL)
-                item = item_by_instance(
-                    latest_source, str(transfer["item_instance_id"])
-                )
-                if item is None:
+                location = locations.get(str(transfer["item_instance_id"]))
+                if location is None:
                     raise LoadoutOperationError(
                         "An exact transfer item disappeared."
                     )
@@ -1861,15 +2056,15 @@ class LoadoutSyncService:
                     else direction
                 )
                 if transfer_direction == "to_vault":
-                    if item.get("source_kind") != "character_inventory":
+                    if location[0] != "character_inventory":
                         raise LoadoutOperationError(
                             "A batched item cannot move to the vault from "
                             "its current location."
                         )
-                    character_id = str(item["character_id"])
+                    character_id = str(location[1])
                     transfer_to_vault = True
                 else:
-                    if item.get("source_kind") != "vault":
+                    if location[0] != "vault":
                         raise LoadoutOperationError(
                             "A batched item is no longer in the vault."
                         )
@@ -1906,27 +2101,35 @@ class LoadoutSyncService:
                         throttle, float(result["throttle_seconds"])
                     )
             await asyncio.sleep(max(TRANSFER_INTERVAL, throttle))
-            if latest_source.get("snapshot", {}).get("source_minted_at"):
-                latest_source = await self._fresh_source_after(
-                    owner, access_token, write_started_at
-                )
+            targeted = await self._targeted_profile_until(
+                access_token,
+                latest_source,
+                components=(102, 201, 205),
+                verification_kind="item_transfer",
+                predicate=lambda profile: all(
+                    transfer_complete(raw_item_locations(profile), transfer)
+                    for transfer in pending
+                ),
+            )
+            if targeted:
+                locations = raw_item_locations(targeted)
             else:
                 latest_source = await self._fresh_source(owner, access_token)
+                locations = {
+                    str(item["item_instance_id"]): (
+                        str(item.get("source_kind") or ""),
+                        str(item.get("character_id"))
+                        if item.get("character_id") is not None
+                        else None,
+                    )
+                    for item in latest_source["items"]
+                    if item.get("item_instance_id")
+                }
             pending = [
                 transfer
                 for transfer in pending
-                if not transfer_complete(latest_source, transfer)
+                if not transfer_complete(locations, transfer)
             ]
-            for verification_delay in PREPARATION_VERIFY_DELAYS:
-                if not pending:
-                    break
-                await asyncio.sleep(verification_delay)
-                latest_source = await self._fresh_source(owner, access_token)
-                pending = [
-                    transfer
-                    for transfer in pending
-                    if not transfer_complete(latest_source, transfer)
-                ]
             LOGGER.info(
                 "Transfer wave %s verified; %s failed member(s), %s queued "
                 "item(s) remain",
@@ -1953,6 +2156,8 @@ class LoadoutSyncService:
             # work fills every remaining slot up to Bungie's transfer cap.
             queue = [*pending, *queue]
 
+        if getattr(self.bungie, "get_profile", None) is not None:
+            await self._fresh_source(owner, access_token)
         return {
             "message": f"{len(transfers)} transfer(s) verified in full waves.",
             "http_status": 200,
@@ -1960,6 +2165,131 @@ class LoadoutSyncService:
             "error_status": "Success",
             "throttle_seconds": throttle,
         }
+
+    def _safe_next_transfer_prefetch(
+        self,
+        operation: dict[str, Any],
+        action: dict[str, Any],
+        source: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Return the next vault arrivals only when current capacity fits."""
+
+        if action.get("action_index") is None:
+            return []
+        current_index = int(action["action_index"])
+        transfers: list[dict[str, Any]] = []
+        transfer_checkpoints = 0
+        for candidate in sorted(
+            operation.get("actions", []),
+            key=lambda row: int(row["action_index"]),
+        ):
+            if int(candidate["action_index"]) <= current_index:
+                continue
+            if candidate.get("status") not in {"pending", "running"}:
+                continue
+            if candidate.get("action_type") == "transfer_to_vault":
+                # Later arrivals may rely on this capacity-producing write.
+                break
+            if (
+                candidate.get("action_type") == "transfer_from_vault"
+                and candidate.get("request", {}).get("mode")
+                == "parallel_transfer"
+            ):
+                rows = candidate.get("request", {}).get("transfers", [])
+                if isinstance(rows, list):
+                    transfers.extend(rows)
+                    transfer_checkpoints += 1
+                if transfer_checkpoints >= 3:
+                    break
+        if not transfers:
+            return []
+        item_defs = self.manifest.resolve_many(
+            "DestinyInventoryItemDefinition",
+            (int(row["item_hash"]) for row in transfers),
+        )
+        target_character = str(operation["target_character_id"])
+        carried_counts: dict[int, int] = {}
+        for item in source["items"]:
+            if (
+                item.get("source_kind") != "character_inventory"
+                or str(item.get("character_id")) != target_character
+            ):
+                continue
+            bucket = item.get("bucket_hash")
+            if bucket is None:
+                return []
+            bucket = int(bucket)
+            carried_counts[bucket] = carried_counts.get(bucket, 0) + 1
+        incoming_counts: dict[int, int] = {}
+        safe: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for transfer in transfers:
+            instance_id = str(transfer["item_instance_id"])
+            if instance_id in seen_ids:
+                continue
+            seen_ids.add(instance_id)
+            if str(transfer.get("target_character_id")) != target_character:
+                continue
+            item = item_by_instance(
+                source, instance_id
+            )
+            if item is None or item.get("source_kind") != "vault":
+                continue
+            try:
+                bucket = intended_bucket_hash(
+                    item_defs.get(int(transfer["item_hash"]))
+                )
+            except LoadoutInspectionError:
+                return []
+            incoming_counts[bucket] = incoming_counts.get(bucket, 0) + 1
+            if (
+                carried_counts.get(bucket, 0) + incoming_counts[bucket]
+                > CHARACTER_BUCKET_CAPACITY
+            ):
+                incoming_counts[bucket] -= 1
+                continue
+            safe.append(transfer)
+        return safe
+
+    async def _submit_transfer_prefetch(
+        self,
+        access_token: str,
+        membership_type: int,
+        transfers: list[dict[str, Any]],
+    ) -> None:
+        """Submit safe look-ahead arrivals; their own checkpoint verifies."""
+
+        async def submit(row: dict[str, Any], offset: int) -> Any:
+            if offset:
+                await asyncio.sleep(offset * TRANSFER_INTERVAL)
+            return await self.bungie.transfer_item(
+                access_token,
+                item_instance_id=str(row["item_instance_id"]),
+                item_hash=int(row["item_hash"]),
+                character_id=str(row["target_character_id"]),
+                membership_type=membership_type,
+                transfer_to_vault=False,
+            )
+
+        results = await asyncio.gather(
+            *(submit(row, index) for index, row in enumerate(transfers)),
+            return_exceptions=True,
+        )
+        failures = sum(isinstance(result, Exception) for result in results)
+        successful_ids = {
+            str(row["item_instance_id"])
+            for row, result in zip(transfers, results, strict=True)
+            if not isinstance(result, Exception)
+        }
+        prefetched_ids = getattr(self, "_prefetched_item_ids", None)
+        if prefetched_ids is not None:
+            prefetched_ids.update(successful_ids)
+        LOGGER.info(
+            "Snapshot look-ahead submitted %s vault arrival(s); %s will "
+            "need normal checkpoint retry",
+            len(transfers),
+            failures,
+        )
 
     async def _apply_socket_wave(
         self,
@@ -2174,23 +2504,31 @@ class LoadoutSyncService:
                         max(CLEAR_LOADOUT_INTERVAL, throttle)
                     )
             await asyncio.sleep(max(LOADOUT_INTERVAL, throttle))
-            if latest_source.get("snapshot", {}).get("source_minted_at"):
-                latest_source = await self._fresh_source_after(
-                    owner, access_token, write_started_at
-                )
+            targeted = await self._targeted_profile_until(
+                access_token,
+                latest_source,
+                components=(206,),
+                verification_kind="clear_loadout",
+                predicate=lambda profile: (
+                    raw_character_loadout_slots(profile, character_id)
+                    is not None
+                    and all(
+                        slot_empty(
+                            raw_character_slot(profile, character_id, index)
+                        )
+                        for index in pending
+                    )
+                ),
+            )
+            if targeted:
+                pending = [
+                    index
+                    for index in pending
+                    if not slot_empty(
+                        raw_character_slot(targeted, character_id, index)
+                    )
+                ]
             else:
-                latest_source = await self._fresh_source(owner, access_token)
-            pending = [
-                index
-                for index in pending
-                if not slot_empty(
-                    character_slot(latest_source, character_id, index)
-                )
-            ]
-            for verification_delay in PREPARATION_VERIFY_DELAYS:
-                if not pending:
-                    break
-                await asyncio.sleep(verification_delay)
                 latest_source = await self._fresh_source(owner, access_token)
                 pending = [
                     index
@@ -2207,6 +2545,10 @@ class LoadoutSyncService:
                 ", ".join(str(index + 1) for index in pending) or "none",
             )
             if not pending:
+                # Refresh durable inventory evidence once after the targeted
+                # component proves the grouped write complete.
+                if targeted:
+                    await self._fresh_source(owner, access_token)
                 return {
                     "message": (
                         f"{len(slot_indexes)} unassigned slot(s) verified "
@@ -2653,12 +2995,43 @@ class LoadoutSyncService:
                                 float(result["throttle_seconds"]),
                             )
             await asyncio.sleep(max(EQUIP_INTERVAL, SOCKET_INTERVAL, throttle))
-            if defer_verification and not last_errors:
+            if defer_verification:
+                if last_errors:
+                    LOGGER.info(
+                        "Deferring %s preparation write error(s) to the "
+                        "combined slot snapshot verifier: %s",
+                        len(last_errors),
+                        "; ".join(last_errors),
+                    )
                 return {
                     "message": (
-                        "Bungie accepted the planned equipment and socket "
-                        "waves; the following loadout snapshot will verify "
-                        "their combined final state."
+                        "Equipment and socket writes were submitted; the "
+                        "following loadout snapshot will verify their "
+                        "combined final state and repair only unresolved "
+                        "targets."
+                    ),
+                    "http_status": 200,
+                    "error_code": 1,
+                    "error_status": "Success",
+                    "throttle_seconds": throttle,
+                }
+            targeted = await self._targeted_profile_until(
+                access_token,
+                latest_source,
+                components=(205, 305),
+                verification_kind="equipment_and_sockets",
+                predicate=lambda profile: raw_preparation_matches(
+                    profile,
+                    character_id,
+                    expected_items,
+                ),
+            )
+            if targeted:
+                return {
+                    "message": (
+                        "Exact equipment and all saved sockets verified "
+                        "through targeted live components after "
+                        f"{wave_index + 1} parallel wave(s)."
                     ),
                     "http_status": 200,
                     "error_code": 1,
@@ -3003,6 +3376,67 @@ class LoadoutSyncService:
             "write. The write is not being treated as failed; wait for "
             "Bungie's profile cache, then use Resume."
         )
+
+    async def _targeted_profile_until(
+        self,
+        access_token: str,
+        source: dict[str, Any],
+        *,
+        components: tuple[int, ...],
+        verification_kind: str,
+        predicate: Any,
+    ) -> dict[str, Any]:
+        """Poll only the live components needed to prove one write settled."""
+
+        getter = getattr(self.bungie, "get_profile", None)
+        if getter is None:
+            # Small service tests and alternate adapters can retain the older
+            # full-snapshot behavior without implementing the optimized API.
+            return {}
+        history = getattr(self, "_verification_latencies", {}).get(
+            verification_kind, []
+        )
+        initial_delay = 0.0
+        if history:
+            # Begin shortly before this session's typical visibility point,
+            # while retaining an immediate read for consistently fast writes.
+            initial_delay = max(0.0, min(4.0, median(history[-8:]) - 0.75))
+        delays = (initial_delay, *TARGETED_VERIFY_DELAYS)
+        started = asyncio.get_running_loop().time()
+        latest: dict[str, Any] = {}
+        for poll_index, delay in enumerate(delays):
+            if delay and (poll_index > 0 or initial_delay):
+                await asyncio.sleep(delay)
+            latest = await getter(
+                access_token,
+                membership_type=int(source["snapshot"]["membership_type"]),
+                membership_id=str(
+                    source["snapshot"]["destiny_membership_id"]
+                ),
+                components=components,
+            )
+            if predicate(latest):
+                elapsed = asyncio.get_running_loop().time() - started
+                LOGGER.info(
+                    "Targeted %s verification settled after %s poll(s) in "
+                    "%.2f second(s)",
+                    verification_kind,
+                    poll_index + 1,
+                    elapsed,
+                )
+                histories = getattr(self, "_verification_latencies", None)
+                if histories is not None:
+                    histories.setdefault(verification_kind, []).append(elapsed)
+                    del histories[verification_kind][:-12]
+                return latest
+        LOGGER.info(
+            "Targeted %s verification remained unsettled after %s poll(s) "
+            "in %.2f second(s)",
+            verification_kind,
+            len(delays),
+            asyncio.get_running_loop().time() - started,
+        )
+        return latest
 
     def _verification_minted_after(
         self,
@@ -3788,8 +4222,12 @@ class LoadoutSyncService:
             early_cleanup_to_vault = []
             cleanup_to_vault.extend(remaining_cleanup[pair_count:])
         replace_jobs = [job for job in slot_jobs if job["kind"] == "replace"]
-        if replace_jobs:
-            replace_jobs[0]["capacity_staging"] = {
+        staging_jobs = replace_jobs or slot_jobs
+        if staging_jobs:
+            # A completely blank set still has twenty clear jobs. Attach its
+            # set-only inventory policy to the first clear so the operation
+            # can evacuate carried gear without requiring a replacement job.
+            staging_jobs[0]["capacity_staging"] = {
                 "vault_offloads": vault_offloads,
                 "inventory_pipeline": inventory_pipeline,
                 "preloads": preloads,
@@ -5115,9 +5553,133 @@ def character_slot(source: dict[str, Any], character_id: str, slot_index: int) -
     return slot if isinstance(slot, dict) else {}
 
 
+def raw_character_slot(
+    profile: dict[str, Any], character_id: str, slot_index: int
+) -> dict[str, Any]:
+    """Read one slot directly from a targeted CharacterLoadouts response."""
+
+    slots = raw_character_loadout_slots(profile, character_id)
+    if slots is None or not 0 <= slot_index < len(slots):
+        return {}
+    slot = slots[slot_index]
+    return slot if isinstance(slot, dict) else {}
+
+
+def raw_character_loadout_slots(
+    profile: dict[str, Any], character_id: str
+) -> list[Any] | None:
+    component = (
+        profile.get("characterLoadouts", {})
+        .get("data", {})
+        .get(character_id)
+    )
+    slots = component.get("loadouts") if isinstance(component, dict) else None
+    return slots if isinstance(slots, list) else None
+
+
+def raw_item_locations(profile: dict[str, Any]) -> dict[str, tuple[str, str | None]]:
+    """Map instance IDs to vault, inventory, or equipped from a small profile."""
+
+    locations: dict[str, tuple[str, str | None]] = {}
+    vault_items = profile.get("profileInventory", {}).get("data", {}).get(
+        "items", []
+    )
+    if isinstance(vault_items, list):
+        for item in vault_items:
+            instance_id = (
+                valid_instance_id(item.get("itemInstanceId"))
+                if isinstance(item, dict)
+                else None
+            )
+            if instance_id is not None:
+                locations[instance_id] = ("vault", None)
+    for component_name, source_kind in (
+        ("characterInventories", "character_inventory"),
+        ("characterEquipment", "equipped"),
+    ):
+        data = profile.get(component_name, {}).get("data", {})
+        if not isinstance(data, dict):
+            continue
+        for character_id, wrapper in data.items():
+            items = wrapper.get("items") if isinstance(wrapper, dict) else None
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                instance_id = (
+                    valid_instance_id(item.get("itemInstanceId"))
+                    if isinstance(item, dict)
+                    else None
+                )
+                if instance_id is not None:
+                    locations[instance_id] = (
+                        source_kind,
+                        str(character_id),
+                    )
+    return locations
+
+
+def raw_preparation_matches(
+    profile: dict[str, Any],
+    character_id: str,
+    expected_items: list[dict[str, Any]],
+) -> bool:
+    """Verify equipped IDs and saved gameplay plugs from targeted components."""
+
+    equipment = (
+        profile.get("characterEquipment", {})
+        .get("data", {})
+        .get(character_id)
+    )
+    raw_items = equipment.get("items") if isinstance(equipment, dict) else None
+    if not isinstance(raw_items, list):
+        return False
+    equipped_ids = {
+        instance_id
+        for item in raw_items
+        if isinstance(item, dict)
+        and (
+            instance_id := valid_instance_id(item.get("itemInstanceId"))
+        ) is not None
+    }
+    expected_ids = {
+        str(item["item_instance_id"]) for item in expected_items
+    }
+    if not expected_ids.issubset(equipped_ids):
+        return False
+    socket_data = profile.get("itemComponents", {}).get("sockets", {}).get(
+        "data", {}
+    )
+    if not isinstance(socket_data, dict):
+        return not any(item.get("plugs") for item in expected_items)
+    for expected in expected_items:
+        instance_id = str(expected["item_instance_id"])
+        component = socket_data.get(instance_id)
+        sockets = component.get("sockets") if isinstance(component, dict) else None
+        if not isinstance(sockets, list):
+            if expected.get("plugs"):
+                return False
+            continue
+        for plug in expected.get("plugs", []):
+            plug_hash = plug.get("plug_hash")
+            if plug.get("filtered") or plug_hash in (
+                None,
+                INVALID_HASH_SENTINEL,
+            ):
+                continue
+            index = int(plug["socket_index"])
+            if index >= len(sockets):
+                return False
+            socket = sockets[index]
+            if (
+                not isinstance(socket, dict)
+                or valid_hash(socket.get("plugHash")) != int(plug_hash)
+            ):
+                return False
+    return True
+
+
 def slot_empty(slot: dict[str, Any]) -> bool:
-    items = slot.get("items") if isinstance(slot, dict) else None
-    return not isinstance(items, list) or not items
+    return raw_loadout_slot_empty(slot)
 
 
 def slot_matches(

@@ -152,7 +152,7 @@ async def confirm_loadout_preview(request: web.Request) -> web.StreamResponse:
             )
         backup_choice = str(form.get("backup_choice") or "")
         await ensure_fresh_loadout_snapshot(
-            request, authenticated, force=True
+            request, authenticated, force=False
         )
         service = request.app[LOADOUT_SYNC_SERVICE_KEY]
         try:
@@ -189,6 +189,10 @@ async def confirm_loadout_preview(request: web.Request) -> web.StreamResponse:
                 character_id=preview["target_character_id"],
                 label=f"Pre-sync backup {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
             )
+        await service.cancel_active_for_character(
+            authenticated.bungie_membership_id,
+            preview["target_character_id"],
+        )
         operation = await asyncio.to_thread(
             service.create_operation,
             authenticated.bungie_membership_id,

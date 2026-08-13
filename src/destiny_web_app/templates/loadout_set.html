@@ -9,7 +9,7 @@
 <section class="set-editor-heading"><div><p class="eyebrow">$class_name · 20-slot mirror</p><h1>$set_name</h1>
 <p>Drag reusable loadouts onto the board. Dropping on an occupied slot replaces it; dragging within the board swaps or moves positions.</p></div>
 <form method="post" action="/loadout-sets/preview">$preview_csrf<input type="hidden" name="set_id" value="$set_id">
-<button class="primary-action" type="submit"$preview_disabled>Preview applying set</button><small>Empty positions clear matching Destiny slots. Non-set carried gear moves to the vault, and the highest occupied position remains equipped. If the vault is full, spare inventory on another character may be used to make room. No automatic backup is created.</small></form></section>
+<button class="primary-action" type="submit"$preview_disabled>Preview applying set</button><small>Empty positions clear matching Destiny slots. A completely blank board clears all 20 slots while leaving current equipment equipped. Non-set carried gear moves to the vault, and for populated sets the highest occupied position remains equipped. If the vault is full, spare inventory on another character may be used to make room. No automatic backup is created.</small></form></section>
 <form method="post" action="/loadout-sets/save" data-set-editor>$save_csrf
 <input type="hidden" name="set_id" value="$set_id"><input type="hidden" name="version" value="$version">
 <section class="set-workspace"><div><div class="set-board" aria-label="Twenty loadout positions">$board</div>

@@ -944,7 +944,7 @@ def render_dashboard_set(
       <form method="post" action="/loadout-sets/preview">
         {preview_csrf}
         <input type="hidden" name="set_id" value="{escape(board['set_id'])}">
-        <button class="primary-action" type="submit"{' disabled' if not board['filled_count'] else ''}>Preview applying set</button>
+        <button class="primary-action" type="submit">Preview applying set</button>
       </form>
       <a class="secondary-action" href="/loadout-sets/{quote(board['set_id'], safe='')}">Edit set</a>
     </div>

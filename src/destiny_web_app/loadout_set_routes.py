@@ -191,7 +191,7 @@ async def loadout_set_page(request: web.Request) -> web.Response:
         delete_csrf=csrf_input(request, "/loadout-sets/delete"),
         rename_csrf=csrf_input(request, "/loadout-sets/rename"),
         preview_csrf=csrf_input(request, "/loadout-sets/preview"),
-        preview_disabled=" disabled" if not board["filled_count"] else "",
+        preview_disabled="",
     )
     return web.Response(
         text=html, content_type="text/html", headers={"Cache-Control": "no-store"}

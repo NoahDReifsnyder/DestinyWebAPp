@@ -126,7 +126,11 @@ class InventoryService:
                     bungie_membership_id,
                 )
                 membership_data = membership_resource["payload"]
-                if force or not membership_resource["fresh"]:
+                # A forced inventory refresh must bypass the profile cache,
+                # but the selected Destiny membership is independent account
+                # metadata. Reuse it until its own expiry instead of adding a
+                # second Bungie request to every operation verification.
+                if not membership_resource["fresh"]:
                     membership_data = await self.bungie.get_current_memberships(
                         access_token
                     )

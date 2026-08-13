@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-# Loadout-specific migrations 8–12 are initialized by LoadoutStore. Keeping
+# Loadout-specific migrations 8–15 are initialized by LoadoutStore. Keeping
 # the aggregate version here lets the generic database safely open an existing
 # loadout-enabled database before that subsystem is constructed.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 # Inventory is a live cache. Retain only the active snapshot; saved loadouts
 # are rebased to it during refresh and independently validated by item ID.
 INVENTORY_HISTORY_LIMIT = 1

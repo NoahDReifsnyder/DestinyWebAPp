@@ -11,7 +11,7 @@ from typing import Any, Callable
 from destiny_web_app.database import Database, as_iso, compact_json, utc_now
 
 
-LOADOUT_SCHEMA_VERSION = 14
+LOADOUT_SCHEMA_VERSION = 15
 
 
 class LoadoutStore:
@@ -34,6 +34,95 @@ class LoadoutStore:
 
         with self.connection() as connection:
             connection.executescript(LOADOUT_SCHEMA)
+            action_table = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'loadout_sync_actions'"
+            ).fetchone()
+            if action_table is not None and "cleanup_inventory" not in str(
+                action_table["sql"]
+            ):
+                # SQLite cannot add a value to a CHECK constraint in place.
+                # Rebuild both the action table and its attempt child while
+                # retaining every durable operation and audit record.
+                connection.executescript(
+                    """
+                    CREATE TABLE loadout_sync_actions_new (
+                        operation_id TEXT NOT NULL,
+                        action_index INTEGER NOT NULL CHECK (action_index >= 0),
+                        action_type TEXT NOT NULL CHECK (action_type IN (
+                            'transfer_to_vault', 'transfer_from_vault', 'equip',
+                            'verify_prepared', 'snapshot', 'identifiers',
+                            'verify_slot', 'clear_slot', 'verify_clear',
+                            'restore_equipment', 'verify_restored',
+                            'insert_socket_plug', 'verify_socket_plug',
+                            'cleanup_inventory'
+                        )),
+                        phase TEXT NOT NULL,
+                        encounter_id TEXT,
+                        assignment_id TEXT,
+                        target_slot_index INTEGER CHECK (target_slot_index >= 0),
+                        item_instance_id TEXT,
+                        request_json TEXT NOT NULL DEFAULT '{}',
+                        expected_json TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL CHECK (status IN (
+                            'pending', 'running', 'completed', 'failed', 'skipped'
+                        )),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                        throttle_seconds REAL NOT NULL DEFAULT 0 CHECK (
+                            throttle_seconds >= 0
+                        ),
+                        last_http_status INTEGER,
+                        last_error_code INTEGER,
+                        last_error_status TEXT,
+                        last_message TEXT,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        PRIMARY KEY (operation_id, action_index),
+                        FOREIGN KEY (operation_id)
+                            REFERENCES loadout_sync_operations(operation_id)
+                            ON DELETE CASCADE
+                    );
+
+                    INSERT INTO loadout_sync_actions_new
+                    SELECT * FROM loadout_sync_actions;
+
+                    CREATE TABLE loadout_sync_action_attempts_new (
+                        operation_id TEXT NOT NULL,
+                        action_index INTEGER NOT NULL,
+                        attempt_number INTEGER NOT NULL CHECK (
+                            attempt_number > 0
+                        ),
+                        status TEXT NOT NULL CHECK (status IN (
+                            'running', 'succeeded', 'failed'
+                        )),
+                        http_status INTEGER,
+                        error_code INTEGER,
+                        error_status TEXT,
+                        message TEXT NOT NULL DEFAULT '',
+                        throttle_seconds REAL NOT NULL DEFAULT 0 CHECK (
+                            throttle_seconds >= 0
+                        ),
+                        started_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        PRIMARY KEY (
+                            operation_id, action_index, attempt_number
+                        ),
+                        FOREIGN KEY (operation_id, action_index)
+                            REFERENCES loadout_sync_actions_new(
+                                operation_id, action_index
+                            ) ON DELETE CASCADE
+                    );
+
+                    INSERT INTO loadout_sync_action_attempts_new
+                    SELECT * FROM loadout_sync_action_attempts;
+                    DROP TABLE loadout_sync_action_attempts;
+                    DROP TABLE loadout_sync_actions;
+                    ALTER TABLE loadout_sync_actions_new
+                        RENAME TO loadout_sync_actions;
+                    ALTER TABLE loadout_sync_action_attempts_new
+                        RENAME TO loadout_sync_action_attempts;
+                    """
+                )
             columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(loadouts)")
@@ -128,6 +217,7 @@ class LoadoutStore:
                 (12, "free socket synchronization actions"),
                 (13, "rebased ephemeral inventory snapshots"),
                 (14, "current-state class loadout sets and cover icons"),
+                (15, "durable set inventory cleanup actions"),
             ):
                 connection.execute(
                     """
@@ -1940,7 +2030,7 @@ CREATE TABLE IF NOT EXISTS loadout_sync_actions (
         'transfer_to_vault', 'transfer_from_vault', 'equip',
         'verify_prepared', 'snapshot', 'identifiers', 'verify_slot',
         'clear_slot', 'verify_clear', 'restore_equipment', 'verify_restored',
-        'insert_socket_plug', 'verify_socket_plug'
+        'insert_socket_plug', 'verify_socket_plug', 'cleanup_inventory'
     )),
     phase TEXT NOT NULL,
     encounter_id TEXT,

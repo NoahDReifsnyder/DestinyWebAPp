@@ -204,6 +204,17 @@ class LoadoutManagerService:
                         f"{character_label(character)} slot {slot_index + 1} "
                         "has an invalid item list."
                     )
+                else:
+                    # Cleared Bungie loadout slots contain ten sentinel rows
+                    # rather than an empty array. They are placeholders, not
+                    # unresolved saved items.
+                    raw_items = [
+                        item
+                        for item in raw_items
+                        if isinstance(item, dict)
+                        and valid_instance_id(item.get("itemInstanceId"))
+                        is not None
+                    ]
                 parsed_items = []
                 for raw_item in raw_items:
                     entry = raw_item if isinstance(raw_item, dict) else {}
@@ -1148,8 +1159,7 @@ class LoadoutManagerService:
         official_icons = {row["hash"] for row in self.loadout_icons()}
         prepared = []
         for position, raw_slot in enumerate(slots):
-            raw_items = raw_slot.get("items") if isinstance(raw_slot, dict) else None
-            if not isinstance(raw_items, list) or not raw_items:
+            if raw_loadout_slot_empty(raw_slot):
                 continue
             display_slot = inspected_slots.get(position, {})
             capture, captured_slot = self._prepare_in_game_slot_capture(
@@ -1221,7 +1231,7 @@ class LoadoutManagerService:
                 "The selected in-game loadout slot is invalid."
             )
         raw_items = raw_slot.get("items")
-        if not isinstance(raw_items, list) or not raw_items:
+        if raw_loadout_slot_empty(raw_slot):
             raise LoadoutInspectionError(
                 "An empty in-game slot cannot be saved as a loadout."
             )
@@ -2194,6 +2204,21 @@ def valid_instance_id(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text.isdecimal() and int(text) > 0 else None
+
+
+def raw_loadout_slot_empty(slot: Any) -> bool:
+    """Recognize both empty arrays and Bungie's sentinel-filled clear slots."""
+
+    if not isinstance(slot, dict):
+        return True
+    items = slot.get("items")
+    if not isinstance(items, list):
+        return True
+    return not any(
+        isinstance(item, dict)
+        and valid_instance_id(item.get("itemInstanceId")) is not None
+        for item in items
+    )
 
 
 def definition_path(
