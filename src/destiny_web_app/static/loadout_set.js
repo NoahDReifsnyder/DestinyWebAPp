@@ -3,11 +3,26 @@
   if (!editor) return;
   const cells = [...editor.querySelectorAll("[data-set-cell]")];
   const status = editor.querySelector("[data-draft-status]");
+  const preview = document.querySelector("[data-loadout-preview]");
   let selected = null;
   let drag = null;
 
   const markChanged = () => { status.textContent = "Unsaved board changes"; status.classList.add("changed"); };
   const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (char) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"})[char]);
+  const previewMarkup = (items) => {
+    if (!items.length) return "";
+    const imageMarkup = (item) => item.icon_path
+      ? `<figure><span><img src="https://www.bungie.net${escapeHtml(item.icon_path)}" alt=""></span><figcaption>${escapeHtml(item.name)}</figcaption></figure>`
+      : `<figure><span class="icon-fallback">?</span><figcaption>${escapeHtml(item.name)}</figcaption></figure>`;
+    const weapons = items.filter((item) => item.category === "Weapons" || item.category === "Super");
+    const armor = items.filter((item) => item.category === "Armor");
+    const subclass = items.filter((item) => ["Abilities", "Aspects", "Fragments"].includes(item.category));
+    const subclassMarkup = ["Abilities", "Aspects", "Fragments"].map((category) => {
+      const group = subclass.filter((item) => item.category === category);
+      return group.length ? `<section><h4>${category}</h4><div class="loadout-preview-grid">${group.map(imageMarkup).join("")}</div></section>` : "";
+    }).join("");
+    return `<div class="loadout-preview-grid loadout-preview-weapons">${weapons.map(imageMarkup).join("")}</div><div class="loadout-preview-body"><section><h4>Armor</h4><div class="loadout-preview-armor">${armor.map(imageMarkup).join("")}</div></section><section><h4>Subclass</h4>${subclassMarkup || '<p class="loadout-preview-empty">No subclass selections saved.</p>'}</section></div>`;
+  };
   const iconMarkup = (id, name, path) => path
     ? `<span class="draft-icon"><img src="https://www.bungie.net${escapeHtml(path)}" alt=""><span class="sr-only">${escapeHtml(name)}</span></span>`
     : `<span class="draft-icon icon-fallback">◇<span class="sr-only">${escapeHtml(name)}</span></span>`;
@@ -56,6 +71,10 @@
       clearSelection();
       tray.classList.add("selected-source");
       selected = { kind: "tray", item: { id: tray.dataset.loadoutId, name: tray.dataset.loadoutName, path: tray.dataset.iconPath } };
+      let previewItems = [];
+      try { previewItems = JSON.parse(tray.dataset.previewJson || "[]"); } catch { previewItems = []; }
+      const previewHtml = previewMarkup(previewItems) || '<p class="loadout-preview-empty">No weapon or armor data saved.</p>';
+      if (preview) preview.innerHTML = `<h3>${escapeHtml(tray.dataset.loadoutName)}</h3>${previewHtml}`;
       return;
     }
     const selectCell = event.target.closest("[data-cell-select]");

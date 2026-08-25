@@ -1624,6 +1624,14 @@ class LoadoutManagerService:
             source = self.database.load_active_loadout_source(
                 str(loadout["bungie_membership_id"])
             )
+        api_name = str(loadout.get("name") or "")
+        name_hash = valid_hash(loadout.get("source_payload", {}).get("nameHash"))
+        if name_hash is not None and self.manifest.status().get("available"):
+            name_definition = self.manifest.resolve_many(
+                "DestinyLoadoutNameDefinition", {name_hash}
+            ).get(name_hash)
+            api_name = display_name(name_definition) or api_name
+        loadout["destiny_api_name"] = api_name
         live_items = {
             str(item["item_instance_id"]): item
             for item in (source["items"] if source is not None else [])
@@ -1640,6 +1648,8 @@ class LoadoutManagerService:
         item_definitions: dict[int, dict[str, Any]] = {}
         plug_definitions: dict[int, dict[str, Any]] = {}
         bucket_definitions: dict[int, dict[str, Any]] = {}
+        socket_types: dict[int, dict[str, Any]] = {}
+        socket_categories: dict[int, dict[str, Any]] = {}
         if self.manifest.status().get("available"):
             item_definitions = self.manifest.resolve_many(
                 "DestinyInventoryItemDefinition", item_hashes
@@ -1650,6 +1660,19 @@ class LoadoutManagerService:
             bucket_definitions = self.manifest.resolve_many(
                 "DestinyInventoryBucketDefinition",
                 (int(item["bucket_hash"]) for item in loadout["items"]),
+            )
+            socket_type_hashes = hashes_from_socket_entries(item_definitions.values())
+            socket_types = self.manifest.resolve_many(
+                "DestinySocketTypeDefinition", socket_type_hashes
+            )
+            socket_category_hashes = {
+                category_hash
+                for socket_type in socket_types.values()
+                if (category_hash := valid_hash(socket_type.get("socketCategoryHash")))
+                is not None
+            }
+            socket_categories = self.manifest.resolve_many(
+                "DestinySocketCategoryDefinition", socket_category_hashes
             )
         for item in loadout["items"]:
             definition = item_definitions.get(int(item["item_hash"]))
@@ -1691,6 +1714,29 @@ class LoadoutManagerService:
             item["live_status"] = "invalid" if item_issues else "valid"
             validation_issues.extend(item_issues)
             for plug in item["plugs"]:
+                item_sockets = (definition or {}).get("sockets", {})
+                socket_entries = (
+                    item_sockets.get("socketEntries", [])
+                    if isinstance(item_sockets, dict)
+                    else []
+                )
+                socket_entry = (
+                    socket_entries[plug["socket_index"]]
+                    if plug["socket_index"] < len(socket_entries)
+                    else {}
+                )
+                socket_type = socket_types.get(
+                    valid_hash(socket_entry.get("socketTypeHash")), {}
+                )
+                category = socket_categories.get(
+                    valid_hash(socket_type.get("socketCategoryHash")), {}
+                )
+                plug["category"] = display_name(category) or plug.get(
+                    "category", "Unmapped socket"
+                )
+                plug["socket_type"] = display_name(socket_type) or plug.get(
+                    "socket_type", ""
+                )
                 plug_definition = (
                     plug_definitions.get(int(plug["plug_hash"]))
                     if plug.get("plug_hash") is not None
@@ -2044,6 +2090,8 @@ def captured_plugs(
             "filtered_from_preview": bool(
                 plug.get("filtered_from_preview")
             ),
+            "category": plug.get("category", ""),
+            "socket_type": plug.get("socket_type", ""),
         }
         for plug in plugs
     ]
@@ -2099,6 +2147,7 @@ def build_plugs(
                 "description": display_description(definition),
                 "icon_path": display_icon(definition),
                 "category": category_name,
+                "socket_type": display_name(socket_type) or "",
                 "socket_type_hash": socket_type_hash,
                 "category_hash": category_hash,
                 "filtered_from_preview": (

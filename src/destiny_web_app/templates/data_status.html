@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Saved data status · Destiny Web App</title>
+    <link rel="stylesheet" href="/static/header.css">
     <style>
       :root {
         color-scheme: dark;
@@ -40,17 +41,26 @@
       button.secondary { background: #45566d; }
       button.danger { background: #9b3440; }
       code { font-size: 0.85em; }
-      nav { display: flex; gap: 1rem; }
+      .topbar { display: grid; min-height: 4rem; padding: 0 2rem; grid-template-columns: 1fr auto 1fr; align-items: center; border-bottom: 1px solid #2d3a4d; background: rgb(13 17 24 / 88%); }
+      .brand { color: #ffd275; font-weight: 800; text-decoration: none; }
+      .topbar nav { display: flex; height: 4rem; align-items: stretch; gap: 0; }
+      .topbar nav a { display: grid; padding: 0 1rem; place-items: center; color: #9cadc1; text-decoration: none; }
+      .topbar nav a.active { border-bottom: 2px solid #ffd275; color: #edf3fa; }
+      .account { justify-self: end; color: #9cadc1; font-size: 0.85rem; }
       @media (max-width: 40rem) {
         main { width: min(100% - 1rem, 76rem); padding-top: 1rem; }
         dl { grid-template-columns: 1fr; gap: 0.2rem; }
         dd { margin-bottom: 0.6rem; }
+        .topbar { padding: 0 1rem; grid-template-columns: 1fr auto; }
+        .topbar nav { order: 3; grid-column: 1 / -1; width: 100%; overflow-x: auto; }
+        .account { display: none; }
       }
     </style>
   </head>
   <body>
+    $header
     <main>
-      <nav><a href="/">Home</a><a href="/data/status.json">JSON status</a></nav>
+      <nav><a href="/data/status.json">JSON status</a></nav>
       <h1>Saved data status</h1>
       <p class="subtitle">$bungie_name · inventory and persistence verification</p>
       <span class="status $status_class">$sync_status</span>

@@ -82,6 +82,7 @@ from destiny_web_app.loadout_routes import (
     capture_current_loadout,
     clone_saved_loadout,
     delete_saved_loadout,
+    delete_duplicate_loadouts,
     export_saved_loadout,
     favorite_saved_loadout,
     import_in_game_loadout,
@@ -108,6 +109,7 @@ from destiny_web_app.loadout_set_routes import (
     create_set_from_character,
     delete_set,
     loadout_set_page,
+    rename_edit_loadout,
     rename_set,
     save_set,
 )
@@ -219,6 +221,7 @@ def create_app(settings: Settings | None = None) -> web.Application:
             ),
             web.get("/loadouts", loadout_manager_page),
             web.get("/loadouts/create", create_loadout_page),
+            web.post("/loadouts/create/rename", rename_edit_loadout),
             web.get("/loadouts/builder", loadout_builder_page),
             web.get("/loadouts/builder/items", loadout_builder_items),
             web.post("/loadouts/builder/save", save_builder_loadout),
@@ -238,6 +241,10 @@ def create_app(settings: Settings | None = None) -> web.Application:
             ),
             web.post("/loadouts/saved/favorite", favorite_saved_loadout),
             web.post("/loadouts/saved/delete", delete_saved_loadout),
+            web.post(
+                "/loadouts/saved/delete-duplicates",
+                delete_duplicate_loadouts,
+            ),
             web.get(
                 "/loadouts/{character_id}/{slot_index}", loadout_slot_page
             ),
@@ -306,17 +313,17 @@ async def home(request: web.Request) -> web.Response:
   <p class="username">{escape(authenticated.display_name)}</p>
   <p>Your browser session and Bungie tokens are stored locally. Access tokens
   refresh automatically before they expire.</p>
-  <p><a href="/auth/status">View non-secret session status</a></p>
   <p><a class="button" href="/loadouts">Open loadout manager</a></p>
-  <p><a href="/inventory">Open inventory</a></p>
-  <p><a href="/cleaner/weapons">Open weapon cleaner</a> ·
-  <a href="/cleaner/armor">Open armor cleaner</a></p>
-  <p><a href="/data/status">Inventory and database status</a></p>
+    <p><a class="button" href="/inventory">Open inventory</a></p>
+    <p><a class="button" href="/cleaner/weapons">Open weapon cleaner</a></p>
+    <p><a class="button" href="/cleaner/armor">Open armor cleaner</a></p>
+    <p><a class="button" href="/data/status">Inventory and database status</a></p>
   {warning_html}
   <form method="post" action="/auth/logout">
     {csrf_input(request, "/auth/logout")}
-    <button type="submit">Sign out</button>
+        <button class="danger" type="submit">Sign out</button>
   </form>
+    <p class="session-status"><a href="/auth/status">View non-secret session status</a></p>
 </section>"""
 
     html = render_template(

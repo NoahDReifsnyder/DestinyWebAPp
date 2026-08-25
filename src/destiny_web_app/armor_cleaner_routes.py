@@ -707,6 +707,9 @@ def render_armor_item(request: web.Request, item: dict[str, Any]) -> str:
 
 
 def render_template(template_name: str, **values: str) -> str:
+    from destiny_web_app.ui import render_header
+
+    values.setdefault("header", render_header(template_name, values))
     return Template(
         (TEMPLATE_ROOT / template_name).read_text(encoding="utf-8")
     ).substitute(values)

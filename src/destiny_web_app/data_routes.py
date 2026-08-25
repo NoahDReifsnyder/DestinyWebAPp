@@ -20,6 +20,7 @@ from destiny_web_app.app_keys import (
 from destiny_web_app.bungie import BungieAuthenticationRejected, BungieError
 from destiny_web_app.auth import csrf_input, require_csrf
 from destiny_web_app.inventory import InventoryDataError
+from destiny_web_app.ui import render_header
 
 
 LOGGER = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ async def synchronize_inventory(request: web.Request) -> web.StreamResponse:
     form = await request.post()
     require_csrf(request, form)
     force = form.get("force") == "true"
+    return_to = local_return_path(str(form.get("return_to") or ""))
     service = request.app[INVENTORY_SERVICE_KEY]
     try:
         result = await service.synchronize(
@@ -102,19 +104,20 @@ async def synchronize_inventory(request: web.Request) -> web.StreamResponse:
             force=force,
         )
     except BungieAuthenticationRejected as error:
-        return redirect_with_error(str(error))
+        return redirect_with_error(str(error), return_to)
     except (BungieError, InventoryDataError, LookupError) as error:
         LOGGER.warning("Inventory synchronization failed: %s", error)
-        return redirect_with_error(str(error))
+        return redirect_with_error(str(error), return_to)
     except Exception:
         LOGGER.exception("Unexpected inventory synchronization failure")
         return redirect_with_error(
             "Inventory synchronization failed. The previous complete snapshot "
-            "was preserved."
+            "was preserved.",
+            return_to,
         )
 
     result_name = "cache" if result.used_cache else "synced"
-    raise web.HTTPSeeOther(f"/data/status?result={result_name}")
+    raise web.HTTPSeeOther(add_query(return_to, result=result_name))
 
 
 async def mark_inventory_stale(request: web.Request) -> web.StreamResponse:
@@ -156,13 +159,28 @@ def require_development(request: web.Request) -> None:
         raise web.HTTPNotFound()
 
 
-def redirect_with_error(message: str) -> web.HTTPSeeOther:
+def local_return_path(value: str) -> str:
+    return value if value.startswith("/") and not value.startswith("//") else "/data/status"
+
+
+def add_query(path: str, **values: str) -> str:
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parsed = urlsplit(path)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update(values)
+    return urlunsplit(("", "", parsed.path, urlencode(query), parsed.fragment))
+
+
+def redirect_with_error(message: str, return_to: str = "/data/status") -> web.HTTPSeeOther:
     # The status page escapes this value before rendering. Keeping this short
     # also avoids putting Bungie's full response content into a URL.
-    from urllib.parse import urlencode
-
-    query = urlencode({"error": " ".join(message.split())[:300]})
-    return web.HTTPSeeOther(f"/data/status?{query}")
+    return web.HTTPSeeOther(
+        add_query(
+            local_return_path(return_to),
+            error=" ".join(message.split())[:300],
+        )
+    )
 
 
 def render_status_template(
@@ -225,6 +243,7 @@ def render_status_template(
         (TEMPLATE_ROOT / "data_status.html").read_text(encoding="utf-8")
     )
     return template.substitute(
+        header=render_header("data_status.html", {"bungie_name": escape(bungie_name)}),
         bungie_name=escape(bungie_name),
         sync_status=escape(sync_status),
         status_class=status_css_class(sync_status),

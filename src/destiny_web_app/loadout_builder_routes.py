@@ -406,4 +406,7 @@ def notice(value: str, tone: str) -> str:
 
 
 def render_template(name: str, **values: str) -> str:
+    from destiny_web_app.ui import render_header
+
+    values.setdefault("header", render_header(name, values))
     return Template((TEMPLATE_ROOT / name).read_text(encoding="utf-8")).safe_substitute(values)

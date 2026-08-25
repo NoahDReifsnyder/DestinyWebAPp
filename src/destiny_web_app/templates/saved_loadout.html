@@ -6,21 +6,10 @@
     <meta name="theme-color" content="#090d12">
     <title>$loadout_name · Saved Loadouts · Destiny Web App</title>
     <link rel="stylesheet" href="/static/loadouts.css">
+    <link rel="stylesheet" href="/static/header.css">
   </head>
   <body>
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Destiny Web App home">
-        <span class="brand-mark">D</span><span>Destiny Web App</span>
-      </a>
-      <nav>
-        <a href="/inventory">Inventory</a>
-        <a class="active" href="/loadouts">Loadouts</a>
-        <a href="/cleaner/weapons">Weapons</a>
-        <a href="/cleaner/armor">Armor</a>
-        <a href="/data/status">Data status</a>
-      </nav>
-      <div class="account"><span class="account-dot"></span>$guardian_name</div>
-    </header>
+    $header
     <main>
       <nav class="breadcrumb" aria-label="Breadcrumb">
         <a href="/loadouts">Loadouts</a><span aria-hidden="true">/</span>
@@ -38,6 +27,7 @@
         $provenance
       </section>
       <section class="loadout-context-actions">$edit_link</section>
+      $local_controls
       <section class="set-usage"><p class="eyebrow">Used by sets</p><div>$set_usages</div></section>
       $status
       $loadout_controls
@@ -49,7 +39,6 @@
         or moved exact instance invalidates this saved loadout.</p>
       </section>
       <section class="loadout-item-list">$item_list</section>
-      $local_controls
     </main>
   </body>
 </html>

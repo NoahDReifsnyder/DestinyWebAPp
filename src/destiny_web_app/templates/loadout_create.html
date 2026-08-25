@@ -1,20 +1,13 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Create loadout · Destiny Web App</title><link rel="stylesheet" href="/static/loadouts.css">
+<title>Edit loadouts · Destiny Web App</title><link rel="stylesheet" href="/static/loadouts.css"><link rel="stylesheet" href="/static/header.css">
 <script src="/static/loadout_create.js" defer></script></head>
-<body><header class="topbar"><a class="brand" href="/"><span class="brand-mark">D</span><span>Destiny Web App</span></a>
-<nav><a href="/inventory">Inventory</a><a class="active" href="/loadouts">Loadouts</a><a href="/cleaner/weapons">Weapons</a><a href="/cleaner/armor">Armor</a></nav>
-<div class="account"><span class="account-dot"></span>$guardian_name</div></header>
-<main><nav class="breadcrumb"><a href="/loadouts">Loadouts</a><span>/</span><span>Create</span></nav>$notices
-<section class="compact-hero"><p class="eyebrow">Import from Destiny</p><h1>Create a loadout</h1>
-<p>Choose a character and one populated in-game slot, then give the reusable app loadout a name and icon.</p></section>
-<form method="post" action="/loadouts/import-slot" class="import-wizard" data-import-wizard>$csrf
+<body>$header
+<main><nav class="breadcrumb"><a href="/loadouts">Loadouts</a><span>/</span><span>Edit loadouts</span></nav>$notices
+<section class="compact-hero"><p class="eyebrow">Loadout editor</p><h1>Edit loadouts</h1>
+<p>Choose a character to review its saved loadouts and manage exact duplicates.</p></section>
+<div class="import-wizard" data-import-wizard>
 <section class="wizard-step"><span>1</span><label>Character<select data-character-picker>$character_options</select></label></section>
-<section class="wizard-step slot-step"><span>2</span><div><strong>In-game slot</strong>$slot_groups</div></section>
-<section class="wizard-step save-step" data-save-step hidden><span>3</span><div class="import-metadata">
-<input type="hidden" name="character_id" data-selected-character><input type="hidden" name="slot_index" data-selected-slot>
-<label>Name<input name="name" maxlength="80" required data-loadout-name></label>
-<fieldset><legend>Destiny icon</legend><div class="icon-picker">$icon_choices</div></fieldset>
-<label>Description<textarea name="description" maxlength="2000" rows="3"></textarea></label>
-<label>Tags<input name="tags" maxlength="400" placeholder="raid, pvp"></label>
-<button type="submit">Save loadout</button></div></section></form></main></body></html>
+<section class="duplicate-check"><button type="button" data-duplicate-toggle>Check for duplicate loadouts</button><div data-duplicate-results hidden><p class="eyebrow">Exact duplicate loadouts</p>$duplicate_loadouts</div></section>
+<section class="saved-loadout-preview" data-saved-preview><p class="eyebrow">Saved loadouts</p><p class="loadout-name-help">Choose a loadout to preview it, then save an application name without changing its Destiny 2 API name.</p><div class="edit-loadout-list">$saved_loadouts</div><details class="selected-loadout-preview" open><summary>Preview selected loadout</summary><form class="selected-loadout-name" method="post" action="/loadouts/create/rename" data-selected-loadout-editor hidden>$rename_csrf<input type="hidden" name="loadout_id" data-selected-loadout-id><label>Application name<input name="name" maxlength="80" required data-selected-loadout-name></label><small>Destiny API name: <span data-destiny-api-name></span></small><button type="submit">Save name</button></form><div data-selected-loadout-preview><p class="loadout-preview-empty">Select a saved loadout to preview its equipment.</p></div></details></section>
+</div></main></body></html>
