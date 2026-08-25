@@ -30,6 +30,7 @@ from destiny_web_app.bungie import (
 )
 from destiny_web_app.config import ConfigurationError
 from destiny_web_app.database import required_string
+from destiny_web_app.ui import reset_render_request, set_render_request
 
 
 LOGGER = logging.getLogger(__name__)
@@ -175,11 +176,14 @@ async def authentication_middleware(
             request[AUTH_SESSION_KEY] = authenticated
 
     raised_response: web.HTTPException | None = None
+    render_request_token = set_render_request(request)
     try:
         response = await handler(request)
     except web.HTTPException as error:
         response = error
         raised_response = error
+    finally:
+        reset_render_request(render_request_token)
     if clear_cookie:
         response.del_cookie(
             settings.session_cookie_name,

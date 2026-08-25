@@ -6,13 +6,10 @@
     <meta name="theme-color" content="#090d12">
     <title>$plan_name · Activity Plans · Destiny Web App</title>
     <link rel="stylesheet" href="/static/loadouts.css">
+    <link rel="stylesheet" href="/static/header.css">
   </head>
   <body>
-    <header class="topbar">
-      <a class="brand" href="/"><span class="brand-mark">D</span><span>Destiny Web App</span></a>
-      <nav><a href="/inventory">Inventory</a><a class="active" href="/loadouts">Loadouts</a><a href="/cleaner/weapons">Weapons</a><a href="/cleaner/armor">Armor</a><a href="/data/status">Data status</a></nav>
-      <div class="account"><span class="account-dot"></span>$guardian_name</div>
-    </header>
+    $header
     <main>
       <nav class="breadcrumb"><a href="/loadouts">Loadouts</a><span>/</span><span>Activity plans</span><span>/</span><span>$activity_name</span></nav>
       $notices

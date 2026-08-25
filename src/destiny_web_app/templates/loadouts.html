@@ -1,14 +1,12 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#090d12"><title>Loadouts · Destiny Web App</title>
-<link rel="stylesheet" href="/static/loadouts.css"></head>
-<body><header class="topbar"><a class="brand" href="/"><span class="brand-mark">D</span><span>Destiny Web App</span></a>
-<nav><a href="/inventory">Inventory</a><a class="active" href="/loadouts">Loadouts</a><a href="/cleaner/weapons">Weapons</a><a href="/cleaner/armor">Armor</a></nav>
-<div class="account"><span class="account-dot"></span>$guardian_name</div></header>
+<link rel="stylesheet" href="/static/loadouts.css"><link rel="stylesheet" href="/static/header.css"></head>
+<body>$header
 <main class="loadout-dashboard"><section class="dashboard-hero"><div><p class="eyebrow">Loadout manager</p>
 <h1>Your loadout sets.</h1><p>Build reusable 20-slot boards that mirror Destiny. Open a set to arrange it, or open any loadout for its exact gear and history.</p></div>
-<div class="dashboard-actions"><a class="primary-action" href="/loadouts/create">Create loadout</a>
-<details class="create-set-menu"><summary>Create set</summary><div class="create-set-panel"><form method="post" action="/loadout-sets/create">$create_set_csrf
+<div class="dashboard-actions"><a class="primary-action" href="/loadouts/create">Edit loadouts</a>
+<details class="create-set-menu"><summary>Create loadout set</summary><div class="create-set-panel"><form method="post" action="/loadout-sets/create">$create_set_csrf
 <label>Name<input name="name" maxlength="100" required placeholder="Raid loadouts"></label>
 <label>Class<select name="character_class" required><option value="0">Titan</option><option value="1">Hunter</option><option value="2">Warlock</option></select></label>
 <button type="submit">Create empty set</button></form><div class="create-set-divider"><span>or</span></div>

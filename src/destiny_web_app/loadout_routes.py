@@ -96,7 +96,10 @@ async def loadout_manager_page(request: web.Request) -> web.Response:
             )
             or '<div class="dashboard-empty">No sets yet.</div>'
         ),
-        all_loadouts=render_all_dashboard_loadouts(saved_loadouts),
+        all_loadouts=render_all_dashboard_loadouts(
+            saved_loadouts,
+            csrf_input(request, "/loadouts/saved/delete"),
+        ),
         create_set_csrf=csrf_input(request, "/loadout-sets/create"),
         import_set_csrf=csrf_input(
             request, "/loadout-sets/create-from-character"
@@ -510,6 +513,42 @@ async def delete_saved_loadout(request: web.Request) -> web.StreamResponse:
         delete,
         "Local loadout permanently deleted. Destiny was not changed.",
         overview_after=True,
+    )
+
+
+async def delete_duplicate_loadouts(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before deleting loadouts.")
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        if str(form.get("confirmation") or "") != "DELETE":
+            raise LoadoutInspectionError(
+                "The duplicate removal confirmation was rejected."
+            )
+        loadout_ids = [str(value) for value in form.getall("loadout_id", [])]
+        service = request.app[LOADOUT_MANAGER_SERVICE_KEY]
+        for loadout_id in loadout_ids:
+            await asyncio.to_thread(
+                service.delete_loadout,
+                authenticated.bungie_membership_id,
+                loadout_id,
+            )
+    except web.HTTPForbidden as error:
+        message = error.text or "The duplicate removal form was rejected."
+        return web.HTTPSeeOther(f"/loadouts/create?{urlencode({'error': message})}")
+    except (LoadoutInspectionError, LookupError, ValueError) as error:
+        return web.HTTPSeeOther(f"/loadouts/create?{urlencode({'error': str(error)})}")
+    except Exception:
+        LOGGER.exception("Unexpected duplicate loadout deletion failure")
+        return web.HTTPSeeOther(
+            "/loadouts/create?"
+            + urlencode({"error": "Duplicate loadouts could not be removed."})
+        )
+    raise web.HTTPSeeOther(
+        "/loadouts/create?"
+        + urlencode({"notice": f"Removed {len(loadout_ids)} duplicate loadouts."})
     )
 
 
@@ -976,7 +1015,10 @@ def render_dashboard_cell(
 </a>"""
 
 
-def render_all_dashboard_loadouts(loadouts: list[dict[str, Any]]) -> str:
+def render_all_dashboard_loadouts(
+    loadouts: list[dict[str, Any]],
+    delete_csrf: str,
+) -> str:
     groups = []
     for class_type, class_name in ((0, "Titan"), (1, "Hunter"), (2, "Warlock")):
         rows = [
@@ -984,9 +1026,14 @@ def render_all_dashboard_loadouts(loadouts: list[dict[str, Any]]) -> str:
             if int(row["character_class_type"]) == class_type
         ]
         icons = "".join(
-            f'<a class="library-icon" href="/loadouts/saved/{quote(row["loadout_id"], safe="")}" '
+            f'<div class="library-loadout"><a class="library-icon" href="/loadouts/saved/{quote(row["loadout_id"], safe="")}" '
             f'title="{escape(row["name"])}" aria-label="Open {escape(row["name"])}">'
-            f'{dashboard_icon(row)}</a>'
+            f'{dashboard_icon(row)}</a><form method="post" action="/loadouts/saved/delete" '
+            f'onclick="return confirm(\'Permanently delete {escape(row["name"], quote=True)}?\')">'
+            f'{delete_csrf}<input type="hidden" name="loadout_id" value="{escape(row["loadout_id"])}">'
+            '<input type="hidden" name="confirmation" value="DELETE">'
+            '<button class="library-delete" type="submit" aria-label="Delete '
+            f'{escape(row["name"], quote=True)}">×</button></form></div>'
             for row in rows
         ) or '<span class="class-empty">No saved loadouts.</span>'
         groups.append(
@@ -1564,6 +1611,9 @@ def loadout_error_response(display_name: str, message: str) -> web.Response:
 
 
 def render_template(template_name: str, **values: str) -> str:
+    from destiny_web_app.ui import render_header
+
+    values.setdefault("header", render_header(template_name, values))
     template = Template(
         (TEMPLATE_ROOT / template_name).read_text(encoding="utf-8")
     )

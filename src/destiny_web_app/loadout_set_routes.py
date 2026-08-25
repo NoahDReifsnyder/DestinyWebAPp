@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 from html import escape
 from pathlib import Path
 from string import Template
@@ -13,6 +14,7 @@ from aiohttp import web
 
 from destiny_web_app.app_keys import (
     AUTH_SESSION_KEY,
+    LOADOUT_MANAGER_SERVICE_KEY,
     LOADOUT_FUNCTIONS_KEY,
 )
 from destiny_web_app.auth import csrf_input, require_csrf
@@ -21,7 +23,7 @@ from destiny_web_app.loadout_freshness import ensure_fresh_loadout_snapshot
 from destiny_web_app.loadout_manager import CLASS_NAMES, LoadoutInspectionError
 from destiny_web_app.loadout_sets import LoadoutSetError
 from destiny_web_app.loadouts.inspection import inspect_in_game_loadouts
-from destiny_web_app.loadouts.library import list_cover_icons, list_loadouts
+from destiny_web_app.loadouts.library import list_loadouts
 from destiny_web_app.loadouts.sets import (
     create_loadout_set,
     create_loadout_set_from_character,
@@ -46,35 +48,48 @@ async def create_loadout_page(request: web.Request) -> web.Response:
         await ensure_fresh_loadout_snapshot(
             request, authenticated, force=True
         )
-        inspection, icons = await asyncio.gather(
+        inspection, saved_loadouts = await asyncio.gather(
             asyncio.to_thread(
                 inspect_in_game_loadouts,
                 functions,
                 authenticated.bungie_membership_id,
             ),
             asyncio.to_thread(
-                list_cover_icons,
+                list_loadouts,
                 functions,
                 authenticated.bungie_membership_id,
+                include_archived=False,
             ),
         )
     except Exception as exc:
         LOGGER.exception("Could not prepare in-game loadout import")
-        inspection, icons = None, []
+        inspection, saved_loadouts = None, []
         error = str(exc)
     characters = inspection["characters"] if inspection else []
     html = render_template(
         "loadout_create.html",
         guardian_name=escape(authenticated.display_name),
-        notices=notice(request.query.get("error", "") or error, "error"),
+        notices=(
+            notice(request.query.get("notice", ""), "success")
+            + notice(request.query.get("error", "") or error, "error")
+        ),
         character_options="".join(
             f'<option value="{escape(row["character_id"])}">'
             f'{escape(row["class_name"])}</option>'
             for row in characters
         ),
-        slot_groups="".join(render_import_character(row) for row in characters),
-        icon_choices=render_icon_choices(icons),
-        csrf=csrf_input(request, "/loadouts/import-slot"),
+        saved_loadouts="".join(
+            render_edit_loadout(
+                row,
+            )
+            for row in saved_loadouts
+        ),
+        rename_csrf=csrf_input(request, "/loadouts/create/rename"),
+        duplicate_loadouts=render_duplicate_loadouts(
+            saved_loadouts,
+            csrf_input(request, "/loadouts/saved/delete-duplicates"),
+            csrf_input(request, "/loadouts/saved/delete"),
+        ),
     )
     return web.Response(
         text=html, content_type="text/html", headers={"Cache-Control": "no-store"}
@@ -193,6 +208,43 @@ async def loadout_set_page(request: web.Request) -> web.Response:
         preview_csrf=csrf_input(request, "/loadout-sets/preview"),
         preview_disabled="",
     )
+
+
+async def rename_edit_loadout(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before renaming a loadout.")
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        loadout_id = str(form.get("loadout_id") or "")
+        name = str(form.get("name") or "")
+        service = request.app[LOADOUT_MANAGER_SERVICE_KEY]
+        current = await asyncio.to_thread(
+            service.saved_loadout,
+            authenticated.bungie_membership_id,
+            loadout_id,
+            include_archived=True,
+        )
+        if current is None:
+            raise LookupError("The saved loadout is unavailable.")
+        await asyncio.to_thread(
+            service.update_metadata,
+            authenticated.bungie_membership_id,
+            loadout_id,
+            name=name,
+            description=current["description"],
+            tags=current["tags"],
+            cover_icon_hash=current.get("cover_icon_hash"),
+        )
+    except Exception as error:
+        LOGGER.exception("Could not rename loadout from edit page")
+        raise web.HTTPSeeOther(
+            "/loadouts/create?" + urlencode({"error": str(error)})
+        )
+    raise web.HTTPSeeOther(
+        "/loadouts/create?" + urlencode({"notice": "Loadout name saved."})
+    )
     return web.Response(
         text=html, content_type="text/html", headers={"Cache-Control": "no-store"}
     )
@@ -284,6 +336,161 @@ def render_import_character(character: dict) -> str:
     )
 
 
+def render_edit_loadout(loadout: dict) -> str:
+    display_name = loadout_display_name(loadout)
+    api_name = str(loadout.get("destiny_api_name") or display_name)
+    preview = json.dumps(
+        detailed_loadout_preview(loadout), separators=(",", ":")
+    )
+    return f'''
+<button type="button" class="edit-loadout" data-edit-loadout
+ data-character-id="{escape(str(loadout.get("source_character_id", "")))}"
+ data-loadout-name="{escape(display_name)}"
+ data-destiny-api-name="{escape(api_name)}"
+ data-preview-json="{escape(preview, quote=True)}"
+ data-loadout-id="{escape(loadout["loadout_id"])}">
+ {image_or_fallback(loadout.get("cover_icon_path"), loadout["class_name"][:1])}
+ <span>{escape(display_name)}</span>
+</button>'''
+
+
+def loadout_display_name(loadout: dict) -> str:
+    return str(loadout.get("name") or loadout.get("destiny_api_name") or "Unnamed loadout")
+
+
+def detailed_loadout_preview(loadout: dict) -> dict[str, list]:
+    armor_buckets = {"helmet", "gauntlets", "chest armor", "leg armor", "class armor"}
+    weapons = []
+    armor = []
+    subclass = {"super": [], "aspects": [], "abilities": [], "fragments": []}
+    for item in loadout.get("items", []):
+        bucket = str(item.get("bucket_name", "")).lower()
+        if "weapon" in bucket:
+            target = weapons
+        elif bucket in armor_buckets:
+            target = armor
+        elif bucket == "subclass":
+            for plug in item.get("plugs", []):
+                if plug.get("plug_hash") is None or not plug.get("icon_path"):
+                    continue
+                category = str(plug.get("category", "")).lower()
+                name = str(plug.get("name", "Unknown selection"))
+                if "super" in category:
+                    group = "super"
+                elif "aspect" in category:
+                    group = "aspects"
+                elif "fragment" in category:
+                    group = "fragments"
+                else:
+                    group = "abilities"
+                subclass[group].append(preview_image(plug))
+            continue
+        else:
+            continue
+        plugs = [
+            plug
+            for plug in item.get("plugs", [])
+            if plug.get("plug_hash") is not None
+            and not is_cosmetic_plug(plug)
+        ]
+        plugs.sort(key=preview_mod_order)
+        target.append(
+            {
+                "name": str(item.get("name", "Unknown item")),
+                "icon_path": str(item.get("icon_path") or ""),
+                "mods": [preview_image(plug) for plug in plugs if plug.get("icon_path")],
+            }
+        )
+    return {"weapons": weapons, "armor": armor, "subclass": subclass}
+
+
+def preview_image(value: dict) -> dict[str, str]:
+    return {
+        "name": str(value.get("name", "Unknown item")),
+        "icon_path": str(value.get("icon_path") or ""),
+    }
+
+
+def preview_mod_order(plug: dict) -> tuple[int, int]:
+    text = " ".join(
+        str(plug.get(key, "")).lower()
+        for key in ("name", "category", "socket_type")
+    )
+    if "stat" in text:
+        priority = 0
+    elif "tuning" in text or "masterwork" in text:
+        priority = 1
+    else:
+        priority = 2
+    return priority, int(plug.get("socket_index", 0))
+
+
+def is_cosmetic_plug(plug: dict) -> bool:
+    text = " ".join(
+        str(plug.get(key, "")).lower()
+        for key in ("name", "category", "socket_type")
+    )
+    return "ornament" in text or "shader" in text
+
+
+def loadout_fingerprint(loadout: dict) -> tuple:
+    return tuple(
+        (
+            int(item.get("bucket_hash", 0)),
+            str(item.get("item_instance_id", "")),
+            tuple(
+                (int(plug.get("socket_index", 0)), plug.get("plug_hash"))
+                for plug in item.get("plugs", [])
+            ),
+        )
+        for item in sorted(
+            loadout.get("items", []),
+            key=lambda item: int(item.get("bucket_hash", 0)),
+        )
+    )
+
+
+def render_duplicate_loadouts(
+    loadouts: list[dict],
+    bulk_delete_csrf: str,
+    delete_csrf: str,
+) -> str:
+    groups: dict[tuple, list[dict]] = {}
+    for loadout in loadouts:
+        groups.setdefault(loadout_fingerprint(loadout), []).append(loadout)
+    duplicates = [group for group in groups.values() if len(group) > 1]
+    if not duplicates:
+        return '<p class="duplicate-empty">No exact duplicate loadouts found.</p>'
+    duplicate_ids = [loadout["loadout_id"] for group in duplicates for loadout in group[1:]]
+    bulk_form = (
+        '<form method="post" action="/loadouts/saved/delete-duplicates" '
+        'onsubmit="return confirm(\'Permanently remove all found duplicate loadouts?\')">'
+        f'{bulk_delete_csrf}'
+        + "".join(
+            f'<input type="hidden" name="loadout_id" value="{escape(loadout_id)}">'
+            for loadout_id in duplicate_ids
+        )
+        + '<input type="hidden" name="confirmation" value="DELETE">'
+        '<button class="danger" type="submit">Remove all duplicates</button></form>'
+    )
+    return bulk_form + "".join(
+        '<section class="duplicate-group">'
+        f'<h3>{escape(group[0]["class_name"])} · {len(group)} exact matches</h3>'
+        '<div class="duplicate-list">'
+        + "".join(
+            f'<div class="duplicate-item"><span>{escape(loadout_display_name(loadout))}</span>'
+            f'<form method="post" action="/loadouts/saved/delete" '
+            f'onclick="return confirm(\'Permanently delete {escape(loadout["name"], quote=True)}?\')">'
+            f'{delete_csrf}<input type="hidden" name="loadout_id" value="{escape(loadout["loadout_id"])}">'
+            '<input type="hidden" name="confirmation" value="DELETE">'
+            '<button class="danger" type="submit">Remove</button></form></div>'
+            for loadout in group[1:]
+        )
+        + "</div></section>"
+        for group in duplicates
+    )
+
+
 def render_import_slot(character: dict, slot: dict) -> str:
     disabled = not slot["items"]
     state = "Empty" if not slot["items"] else (
@@ -335,14 +542,88 @@ def render_editor_cell(position: int, row: dict | None, board: dict) -> str:
 
 
 def render_tray_item(loadout: dict) -> str:
+    preview = json.dumps(loadout_preview_items(loadout), separators=(",", ":"))
     return f"""
 <button type="button" class="tray-loadout" draggable="true" data-tray-loadout
  data-loadout-id="{escape(loadout['loadout_id'])}" data-loadout-name="{escape(loadout['name'])}"
  data-icon-path="{escape(loadout.get('cover_icon_path') or '')}"
+ data-preview-json="{escape(preview, quote=True)}"
  aria-label="Select {escape(loadout['name'])}">
  {image_or_fallback(loadout.get('cover_icon_path'), loadout['class_name'][:1])}
  <span>{escape(loadout['name'])}</span>
 </button>"""
+
+
+def loadout_preview_items(loadout: dict) -> list[dict[str, str]]:
+    armor_slots = {"helmet", "gauntlets", "chest armor", "leg armor", "class armor"}
+    items = [
+        item
+        for item in loadout.get("items", [])
+        if "weapon" in str(item.get("bucket_name", "")).lower()
+        or str(item.get("bucket_name", "")).lower() in armor_slots
+    ]
+    weapon_items = [
+        {
+            "category": "Weapons",
+            "name": str(item.get("name", "Unknown item")),
+            "icon_path": str(item.get("icon_path") or ""),
+        }
+        for item in items
+        if "weapon" in str(item.get("bucket_name", "")).lower()
+    ]
+    armor_items = [
+        {
+            "category": "Armor",
+            "name": str(item.get("name", "Unknown item")),
+            "icon_path": str(item.get("icon_path") or ""),
+        }
+        for item in items
+        if str(item.get("bucket_name", "")).lower() in armor_slots
+    ]
+    subclass = next(
+        (
+            item
+            for item in loadout.get("items", [])
+            if str(item.get("bucket_name", "")).lower() == "subclass"
+        ),
+        None,
+    )
+    plugs = (subclass or {}).get("plugs") or []
+    super_plug = next(
+        (
+            plug
+            for plug in plugs
+            if "super" in str(plug.get("category", "")).lower()
+        ),
+        {},
+    )
+    super_items = []
+    subclass_items = []
+    if super_plug.get("icon_path"):
+        super_items.append(
+            {
+                "category": "Super",
+                "name": str(super_plug.get("name", "Super")),
+                "icon_path": str(super_plug["icon_path"]),
+            }
+        )
+    for plug in plugs:
+        if plug.get("plug_hash") is None:
+            continue
+        category = str(plug.get("category", "")).lower()
+        name = str(plug.get("name", "Unknown ability"))
+        if "super" in category:
+            continue
+        if "fragment" in category:
+            group = "Fragments"
+        elif "aspect" in category:
+            group = "Aspects"
+        else:
+            group = "Abilities"
+        subclass_items.append(
+            {"category": group, "name": name, "icon_path": str(plug.get("icon_path") or "")}
+        )
+    return weapon_items + super_items + armor_items + subclass_items
 
 
 def render_loadout_icon(loadout: dict, position: int, set_id: str) -> str:
@@ -367,4 +648,7 @@ def notice(value: str, tone: str) -> str:
 
 
 def render_template(name: str, **values: str) -> str:
+    from destiny_web_app.ui import render_header
+
+    values.setdefault("header", render_header(name, values))
     return Template((TEMPLATE_ROOT / name).read_text(encoding="utf-8")).substitute(values)
