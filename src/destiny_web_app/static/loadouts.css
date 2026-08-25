@@ -224,6 +224,7 @@ a { color: inherit; }
 .selected-loadout-name button:hover { background: var(--gold); color: #15130d; }
 .loadout-name-help { color: var(--muted); font-size: .7rem; }
 .selected-loadout-preview { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.selected-loadout-editor-area { display: block; width: 100%; }
 .selected-loadout-preview > summary { color: var(--gold); cursor: pointer; font-size: .7rem; font-weight: 800; }
 .selected-loadout-preview > [data-selected-loadout-preview] { margin-top: .8rem; }
 .selected-loadout-preview h3 { margin: 0 0 .7rem; color: var(--gold); font-family: Georgia, serif; font-size: 1.1rem; font-weight: 400; }

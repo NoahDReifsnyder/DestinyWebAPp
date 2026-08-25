@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Edit loadouts · Destiny Web App</title><link rel="stylesheet" href="/static/loadouts.css"><link rel="stylesheet" href="/static/header.css">
-<script src="/static/loadout_create.js" defer></script></head>
+<script src="/static/loadout_create.js?v=5" defer></script></head>
 <body>$header
 <main><nav class="breadcrumb"><a href="/loadouts">Loadouts</a><span>/</span><span>Edit loadouts</span></nav>$notices
 <section class="compact-hero"><p class="eyebrow">Loadout editor</p><h1>Edit loadouts</h1>
@@ -9,5 +9,5 @@
 <div class="import-wizard" data-import-wizard>
 <section class="wizard-step"><span>1</span><label>Character<select data-character-picker>$character_options</select></label></section>
 <section class="duplicate-check"><button type="button" data-duplicate-toggle>Check for duplicate loadouts</button><div data-duplicate-results hidden><p class="eyebrow">Exact duplicate loadouts</p>$duplicate_loadouts</div></section>
-<section class="saved-loadout-preview" data-saved-preview><p class="eyebrow">Saved loadouts</p><p class="loadout-name-help">Choose a loadout to preview it, then save an application name without changing its Destiny 2 API name.</p><div class="edit-loadout-list">$saved_loadouts</div><details class="selected-loadout-preview" open><summary>Preview selected loadout</summary><form class="selected-loadout-name" method="post" action="/loadouts/create/rename" data-selected-loadout-editor hidden>$rename_csrf<input type="hidden" name="loadout_id" data-selected-loadout-id><label>Application name<input name="name" maxlength="80" required data-selected-loadout-name></label><small>Destiny API name: <span data-destiny-api-name></span></small><button type="submit">Save name</button></form><div data-selected-loadout-preview><p class="loadout-preview-empty">Select a saved loadout to preview its equipment.</p></div></details></section>
+<section class="saved-loadout-preview" data-saved-preview><p class="eyebrow">Saved loadouts</p><p class="loadout-name-help">Choose a loadout to preview it, then save an application name without changing its Destiny 2 API name.</p><div class="edit-loadout-list" data-saved-loadout-list>$saved_loadouts</div><details class="selected-loadout-preview" open><summary>Preview selected loadout</summary><div class="selected-loadout-editor-area"><form class="selected-loadout-name" method="post" action="/loadouts/create/rename" data-selected-loadout-editor hidden>$rename_csrf<input type="hidden" name="loadout_id" data-selected-loadout-id><label>Application name<input id="selected-loadout-name-input" name="name" maxlength="80" required></label><small>Destiny API name: <span data-destiny-api-name></span></small><button type="submit">Save name</button></form><div id="selected-loadout-preview-content" class="selected-loadout-preview-content"><p class="loadout-preview-empty">Select a saved loadout to preview its equipment.</p></div></div></details></section>
 </div></main></body></html>
