@@ -289,10 +289,32 @@ def delete_loadout(
     user_id: str,
     *,
     loadout_id: str,
+    detach_from_sets: bool = False,
 ) -> None:
-    """Delete an unreferenced loadout and its revisions."""
+    """Delete a loadout and its revisions, optionally unpinning it from sets."""
 
-    functions.library.delete_loadout(user_id, loadout_id)
+    functions.library.delete_loadout(
+        user_id, loadout_id, detach_from_sets=detach_from_sets
+    )
+
+
+def list_loadout_set_memberships(
+    functions: LoadoutFunctions,
+    user_id: str,
+    *,
+    loadout_id: str,
+) -> list[dict[str, Any]]:
+    """List every saved set position that currently pins one loadout."""
+
+    return functions.library.loadout_set_memberships(user_id, loadout_id)
+
+
+def list_set_membership_names(
+    functions: LoadoutFunctions, user_id: str
+) -> dict[str, list[str]]:
+    """Map every pinned loadout to the names of the sets that pin it."""
+
+    return functions.library.loadout_set_membership_names(user_id)
 
 
 def export_loadout(

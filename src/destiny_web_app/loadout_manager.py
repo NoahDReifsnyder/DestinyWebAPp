@@ -1477,8 +1477,24 @@ class LoadoutManagerService:
         self,
         bungie_membership_id: str,
         loadout_id: str,
+        *,
+        detach_from_sets: bool = False,
     ) -> None:
-        self.database.delete_loadout(bungie_membership_id, loadout_id)
+        self.database.delete_loadout(
+            bungie_membership_id, loadout_id, detach_from_sets=detach_from_sets
+        )
+
+    def loadout_set_memberships(
+        self,
+        bungie_membership_id: str,
+        loadout_id: str,
+    ) -> list[dict[str, Any]]:
+        return self.database.loadout_set_memberships(bungie_membership_id, loadout_id)
+
+    def loadout_set_membership_names(
+        self, bungie_membership_id: str
+    ) -> dict[str, list[str]]:
+        return self.database.loadout_set_membership_names(bungie_membership_id)
 
     def compare_revisions(
         self,

@@ -23,7 +23,7 @@ from destiny_web_app.loadout_freshness import ensure_fresh_loadout_snapshot
 from destiny_web_app.loadout_manager import CLASS_NAMES, LoadoutInspectionError
 from destiny_web_app.loadout_sets import LoadoutSetError
 from destiny_web_app.loadouts.inspection import inspect_in_game_loadouts
-from destiny_web_app.loadouts.library import list_loadouts
+from destiny_web_app.loadouts.library import list_loadouts, list_set_membership_names
 from destiny_web_app.loadouts.sets import (
     create_loadout_set,
     create_loadout_set_from_character,
@@ -61,9 +61,15 @@ async def create_loadout_page(request: web.Request) -> web.Response:
                 include_archived=False,
             ),
         )
+        set_memberships = await asyncio.to_thread(
+            list_set_membership_names,
+            functions,
+            authenticated.bungie_membership_id,
+        )
     except Exception as exc:
         LOGGER.exception("Could not prepare in-game loadout import")
         inspection, saved_loadouts = None, []
+        set_memberships = {}
         error = str(exc)
     characters = inspection["characters"] if inspection else []
     html = render_template(
@@ -81,10 +87,12 @@ async def create_loadout_page(request: web.Request) -> web.Response:
         saved_loadouts="".join(
             render_edit_loadout(
                 row,
+                set_memberships.get(str(row["loadout_id"]), []),
             )
             for row in saved_loadouts
         ),
         rename_csrf=csrf_input(request, "/loadouts/create/rename"),
+        delete_csrf=csrf_input(request, "/loadouts/create/delete"),
         duplicate_loadouts=render_duplicate_loadouts(
             saved_loadouts,
             csrf_input(request, "/loadouts/saved/delete-duplicates"),
@@ -208,6 +216,9 @@ async def loadout_set_page(request: web.Request) -> web.Response:
         preview_csrf=csrf_input(request, "/loadout-sets/preview"),
         preview_disabled="",
     )
+    return web.Response(
+        text=html, content_type="text/html", headers={"Cache-Control": "no-store"}
+    )
 
 
 async def rename_edit_loadout(request: web.Request) -> web.StreamResponse:
@@ -245,8 +256,44 @@ async def rename_edit_loadout(request: web.Request) -> web.StreamResponse:
     raise web.HTTPSeeOther(
         "/loadouts/create?" + urlencode({"notice": "Loadout name saved."})
     )
-    return web.Response(
-        text=html, content_type="text/html", headers={"Cache-Control": "no-store"}
+
+
+async def delete_edit_loadout(request: web.Request) -> web.StreamResponse:
+    authenticated = request.get(AUTH_SESSION_KEY)
+    if authenticated is None:
+        raise web.HTTPUnauthorized(text="Sign in before deleting a loadout.")
+    try:
+        form = await request.post()
+        require_csrf(request, form)
+        loadout_id = str(form.get("loadout_id") or "")
+        detach = str(form.get("remove_from_sets") or "") == "1"
+        service = request.app[LOADOUT_MANAGER_SERVICE_KEY]
+        memberships = await asyncio.to_thread(
+            service.loadout_set_memberships,
+            authenticated.bungie_membership_id,
+            loadout_id,
+        )
+        if memberships and not detach:
+            names = sorted({str(row["name"]) for row in memberships})
+            raise LoadoutSetError(
+                "This loadout is used by "
+                + ", ".join(names)
+                + ". Confirm removal from those sets before deleting it."
+            )
+        await asyncio.to_thread(
+            service.delete_loadout,
+            authenticated.bungie_membership_id,
+            loadout_id,
+            detach_from_sets=detach,
+        )
+    except Exception as error:
+        LOGGER.exception("Could not delete loadout from edit page")
+        raise web.HTTPSeeOther("/loadouts/create?" + urlencode({"error": str(error)}))
+    notice_text = "Loadout deleted. Destiny was not changed."
+    if memberships:
+        notice_text += f" Removed from {len(memberships)} set position(s)."
+    raise web.HTTPSeeOther(
+        "/loadouts/create?" + urlencode({"notice": notice_text})
     )
 
 
@@ -336,18 +383,20 @@ def render_import_character(character: dict) -> str:
     )
 
 
-def render_edit_loadout(loadout: dict) -> str:
+def render_edit_loadout(loadout: dict, set_names: list[str] | None = None) -> str:
     display_name = loadout_display_name(loadout)
     api_name = str(loadout.get("destiny_api_name") or display_name)
     preview = json.dumps(
         detailed_loadout_preview(loadout), separators=(",", ":")
     )
+    sets = json.dumps(set_names or [], separators=(",", ":"))
     return f'''
 <button type="button" class="edit-loadout" data-edit-loadout
  data-character-id="{escape(str(loadout.get("source_character_id", "")))}"
  data-loadout-name="{escape(display_name)}"
  data-destiny-api-name="{escape(api_name)}"
  data-preview-json="{escape(preview, quote=True)}"
+ data-set-names="{escape(sets, quote=True)}"
  data-loadout-id="{escape(loadout["loadout_id"])}">
  {image_or_fallback(loadout.get("cover_icon_path"), loadout["class_name"][:1])}
  <span>{escape(display_name)}</span>

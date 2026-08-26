@@ -23,6 +23,12 @@
   const destinyApiName = selectedLoadoutEditor?.querySelector(
     "[data-destiny-api-name]"
   );
+  const deleteForm = form.querySelector("[data-selected-loadout-delete]");
+  const deleteLoadoutId = deleteForm?.querySelector("[data-delete-loadout-id]");
+  const deleteRemoveFromSets = deleteForm?.querySelector(
+    "[data-delete-remove-from-sets]"
+  );
+  const deleteSetWarning = deleteForm?.querySelector("[data-delete-set-warning]");
   const duplicateToggle = form.querySelector("[data-duplicate-toggle]");
   const duplicateResults = form.querySelector("[data-duplicate-results]");
 
@@ -65,6 +71,7 @@
         '<p class="loadout-preview-empty">Select a saved loadout to preview its equipment.</p>';
     }
     if (selectedLoadoutEditor) selectedLoadoutEditor.hidden = true;
+    if (deleteForm) deleteForm.hidden = true;
     if (savedPreview) {
       savedPreview.hidden = !savedLoadouts.some(
         (loadout) => loadout.dataset.characterId === characterPicker.value
@@ -155,6 +162,15 @@
       : "Hide duplicate loadouts";
   });
 
+  const setNamesFor = (loadout) => {
+    try {
+      const names = JSON.parse(loadout.dataset.setNames || "[]");
+      return Array.isArray(names) ? names : [];
+    } catch {
+      return [];
+    }
+  };
+
   const selectLoadout = (loadout) => {
     savedLoadouts.forEach((row) => row.classList.remove("selected"));
     loadout.classList.add("selected");
@@ -163,7 +179,35 @@
     destinyApiName.textContent = loadout.dataset.destinyApiName;
     selectedLoadoutEditor.hidden = false;
     selectedLoadoutPreview.innerHTML = renderSelectedLoadout(loadout);
+
+    if (!deleteForm) return;
+    const setNames = setNamesFor(loadout);
+    deleteForm.hidden = false;
+    deleteLoadoutId.value = loadout.dataset.loadoutId;
+    deleteRemoveFromSets.value = "0";
+    deleteSetWarning.hidden = !setNames.length;
+    deleteSetWarning.textContent = setNames.length
+      ? `Used by ${setNames.length} saved set(s): ${setNames.join(", ")}.`
+      : "";
   };
+
+  deleteForm?.addEventListener("submit", (event) => {
+    const selected = savedLoadouts.find(
+      (row) => row.dataset.loadoutId === deleteLoadoutId.value
+    );
+    const setNames = selected ? setNamesFor(selected) : [];
+    const name = selected ? selected.dataset.loadoutName : "this loadout";
+    const message = setNames.length
+      ? `"${name}" is used by ${setNames.length} saved set(s): ${setNames.join(", ")}.\n\n`
+        + "Delete it and remove it from those sets? This cannot be undone."
+      : `Permanently delete "${name}"? This cannot be undone.`;
+
+    if (!window.confirm(message)) {
+      event.preventDefault();
+      return;
+    }
+    deleteRemoveFromSets.value = setNames.length ? "1" : "0";
+  });
 
   savedLoadouts.forEach((loadout) => {
     loadout.addEventListener("click", () => {

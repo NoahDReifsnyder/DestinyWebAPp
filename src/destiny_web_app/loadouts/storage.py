@@ -656,7 +656,46 @@ class LoadoutStore:
         if not changed:
             raise LookupError("The saved loadout is unavailable.")
 
-    def delete_loadout(self, user_id: str, loadout_id: str) -> None:
+    def loadout_set_membership_names(self, user_id: str) -> dict[str, list[str]]:
+        """Map every pinned loadout to the names of the sets that pin it."""
+
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT slot.loadout_id, board.name
+                FROM loadout_set_slots AS slot
+                JOIN loadout_sets AS board ON board.set_id = slot.set_id
+                WHERE board.bungie_membership_id = ?
+                ORDER BY board.name
+                """,
+                (user_id,),
+            ).fetchall()
+        memberships: dict[str, list[str]] = {}
+        for row in rows:
+            memberships.setdefault(row["loadout_id"], []).append(row["name"])
+        return memberships
+
+    def loadout_set_memberships(
+        self, user_id: str, loadout_id: str
+    ) -> list[dict[str, Any]]:
+        """List every set position that currently pins one loadout."""
+
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT board.set_id, board.name, slot.position
+                FROM loadout_set_slots AS slot
+                JOIN loadout_sets AS board ON board.set_id = slot.set_id
+                WHERE board.bungie_membership_id = ? AND slot.loadout_id = ?
+                ORDER BY board.name, slot.position
+                """,
+                (user_id, loadout_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_loadout(
+        self, user_id: str, loadout_id: str, *, detach_from_sets: bool = False
+    ) -> None:
         """Delete a loadout unless a current set or legacy plan pins it."""
 
         with self.connection() as connection:
@@ -670,9 +709,29 @@ class LoadoutStore:
                 """,
                 (user_id, loadout_id),
             ).fetchone()
-            if current_set is not None:
+            if current_set is not None and not detach_from_sets:
                 raise ValueError(
                     f"Remove this loadout from {current_set['name']} before deleting it."
+                )
+            if current_set is not None:
+                connection.execute(
+                    """
+                    UPDATE loadout_sets SET updated_at = ?
+                    WHERE bungie_membership_id = ? AND set_id IN (
+                        SELECT set_id FROM loadout_set_slots WHERE loadout_id = ?
+                    )
+                    """,
+                    (as_iso(utc_now()), user_id, loadout_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM loadout_set_slots
+                    WHERE loadout_id = ? AND set_id IN (
+                        SELECT set_id FROM loadout_sets
+                        WHERE bungie_membership_id = ?
+                    )
+                    """,
+                    (loadout_id, user_id),
                 )
             changed = connection.execute(
                 "DELETE FROM loadouts WHERE bungie_membership_id = ? AND loadout_id = ?",

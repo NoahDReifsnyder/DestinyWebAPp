@@ -222,6 +222,11 @@ a { color: inherit; }
 .selected-loadout-name input { width: 100%; margin-top: .2rem; padding: .45rem; border: 1px solid var(--line); background: #0b1117; color: var(--ink); font: inherit; font-size: .7rem; }
 .selected-loadout-name button { justify-self: start; padding: .5rem .7rem; border: 1px solid var(--gold); background: transparent; color: var(--gold); cursor: pointer; font: inherit; font-size: .65rem; font-weight: 800; }
 .selected-loadout-name button:hover { background: var(--gold); color: #15130d; }
+.selected-loadout-delete { display: grid; margin-top: .8rem; gap: .4rem; justify-items: start; }
+.selected-loadout-delete[hidden] { display: none; }
+.selected-loadout-delete button.danger { padding: .5rem .7rem; border: 1px solid #b3423a; background: transparent; color: #e0796f; cursor: pointer; font: inherit; font-size: .65rem; font-weight: 800; }
+.selected-loadout-delete button.danger:hover { background: #b3423a; color: #15130d; }
+.delete-set-warning { margin: 0; color: #e0a24a; font-size: .65rem; }
 .loadout-name-help { color: var(--muted); font-size: .7rem; }
 .selected-loadout-preview { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 .selected-loadout-editor-area { display: block; width: 100%; }
