@@ -15,6 +15,7 @@ from destiny_web_app.database import (
     InventorySnapshot,
     utc_now,
 )
+from destiny_web_app.manifest import ManifestService
 
 
 # One GetProfile response forms one coherent inventory snapshot.
@@ -80,11 +81,13 @@ class InventoryService:
         self,
         database: Database,
         bungie: BungieClient,
+        manifest: ManifestService,
         *,
         stale_seconds: int,
     ) -> None:
         self.database = database
         self.bungie = bungie
+        self.manifest = manifest
         self.stale_seconds = stale_seconds
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -106,6 +109,7 @@ class InventoryService:
                 and current.get("sync_status") == "fresh"
                 and current.get("snapshot_id")
             ):
+                await self.manifest.synchronize()
                 await asyncio.to_thread(
                     self.database.record_inventory_cache_hit,
                     bungie_membership_id,
@@ -168,6 +172,7 @@ class InventoryService:
                 self.database.inventory_status,
                 bungie_membership_id,
             )
+            await self.manifest.synchronize()
             return InventorySyncResult(
                 snapshot_id=snapshot_id,
                 used_cache=False,

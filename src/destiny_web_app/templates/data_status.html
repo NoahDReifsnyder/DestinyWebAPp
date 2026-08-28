@@ -82,6 +82,23 @@
         </div>
       </section>
 
+      <section class="card">
+        <h2>Destiny definitions</h2>
+        <p>Status: <strong class="$manifest_status_class">$manifest_available</strong></p>
+        <div class="actions">
+          <form method="post" action="/data/manifest/sync">
+            $csrf_manifest
+            <input type="hidden" name="force" value="true">
+            <button type="submit">Refresh manifest</button>
+          </form>
+        </div>
+        <dl>
+          <dt>Version</dt><dd>$manifest_version</dd>
+          <dt>Configured path</dt><dd><code>$manifest_path</code></dd>
+          <dt>Last error</dt><dd>$manifest_error</dd>
+        </dl>
+      </section>
+
       <div class="grid">
         <section class="card">
           <h2>Database</h2>

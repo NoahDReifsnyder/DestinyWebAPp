@@ -15,11 +15,13 @@ from destiny_web_app.app_keys import (
     AUTH_SESSION_KEY,
     DATABASE_KEY,
     INVENTORY_SERVICE_KEY,
+    MANIFEST_SERVICE_KEY,
     SETTINGS_KEY,
 )
 from destiny_web_app.bungie import BungieAuthenticationRejected, BungieError
 from destiny_web_app.auth import csrf_input, require_csrf
 from destiny_web_app.inventory import InventoryDataError
+from destiny_web_app.manifest import public_manifest_error
 from destiny_web_app.ui import render_header
 
 
@@ -43,6 +45,7 @@ async def data_status(request: web.Request) -> web.Response:
         database.inventory_status,
         authenticated.bungie_membership_id,
     )
+    manifest_status = read_manifest_status(request)
     result = request.query.get("result")
     notice = {
         "synced": "A complete inventory snapshot was fetched and saved.",
@@ -52,7 +55,7 @@ async def data_status(request: web.Request) -> web.Response:
             "A controlled refresh failure was recorded. The prior complete "
             "snapshot remains active."
         ),
-    }.get(result, "")
+    }.get(result, request.query.get("notice", ""))
     error = request.query.get("error", "")
 
     html = render_status_template(
@@ -67,6 +70,8 @@ async def data_status(request: web.Request) -> web.Response:
             request,
             "/data/inventory/simulate-failure",
         ),
+        csrf_manifest=csrf_input(request, "/data/manifest/sync"),
+        manifest_status=manifest_status,
     )
     return web.Response(
         text=html,
@@ -81,10 +86,12 @@ async def data_status_json(request: web.Request) -> web.Response:
         request.app[DATABASE_KEY].inventory_status,
         authenticated.bungie_membership_id,
     )
+    manifest_status = read_manifest_status(request)
     return web.json_response(
         {
             "bungie_name": authenticated.display_name,
             **status,
+            "manifest": manifest_status,
         },
         headers={"Cache-Control": "no-store"},
     )
@@ -120,6 +127,25 @@ async def synchronize_inventory(request: web.Request) -> web.StreamResponse:
     raise web.HTTPSeeOther(add_query(return_to, result=result_name))
 
 
+async def synchronize_manifest(request: web.Request) -> web.StreamResponse:
+    require_authenticated(request)
+    form = await request.post()
+    require_csrf(request, form)
+    try:
+        result = await request.app[MANIFEST_SERVICE_KEY].synchronize(
+            force=form.get("force") == "true"
+        )
+    except Exception as error:
+        LOGGER.warning("Manifest synchronization failed: %s", error)
+        return redirect_with_error(public_manifest_error(error))
+    message = (
+        "Destiny definitions were refreshed."
+        if result.get("downloaded")
+        else "Destiny definitions are already current."
+    )
+    raise web.HTTPSeeOther(add_query("/data/status", notice=message))
+
+
 async def mark_inventory_stale(request: web.Request) -> web.StreamResponse:
     authenticated = require_authenticated(request)
     require_development(request)
@@ -152,6 +178,22 @@ def require_authenticated(request: web.Request):
             text="Sign in with Bungie before accessing saved user data."
         )
     return authenticated
+
+
+def read_manifest_status(request: web.Request) -> dict[str, Any]:
+    try:
+        return request.app[MANIFEST_SERVICE_KEY].status()
+    except Exception as error:
+        LOGGER.exception("Unable to read manifest status")
+        return {
+            "available": False,
+            "version": None,
+            "configured_path": str(
+                request.app[SETTINGS_KEY].manifest_path
+            ),
+            "local_error": public_manifest_error(error),
+            "last_error": None,
+        }
 
 
 def require_development(request: web.Request) -> None:
@@ -193,6 +235,8 @@ def render_status_template(
     csrf_sync: str,
     csrf_stale: str,
     csrf_failure: str,
+    csrf_manifest: str,
+    manifest_status: dict[str, Any],
 ) -> str:
     characters = status.get("characters") or []
     character_rows = "".join(character_row(character) for character in characters)
@@ -249,6 +293,23 @@ def render_status_template(
         status_class=status_css_class(sync_status),
         notice=message_html(notice, "notice"),
         error=message_html(error, "error"),
+        manifest_available=(
+            "Available" if manifest_status.get("available") else "Unavailable"
+        ),
+        manifest_status_class=(
+            "pass" if manifest_status.get("available") else "fail"
+        ),
+        manifest_version=escape(str(manifest_status.get("version") or "None")),
+        manifest_path=escape(
+            str(manifest_status.get("configured_path") or "Unknown")
+        ),
+        manifest_error=escape(
+            str(
+                manifest_status.get("local_error")
+                or manifest_status.get("last_error")
+                or "None"
+            )
+        ),
         schema_version=escape(str(status.get("schema_version", 0))),
         expected_schema_version=escape(
             str(status.get("expected_schema_version", 0))
@@ -298,6 +359,7 @@ def render_status_template(
         resource_rows=resource_rows,
         development_controls=development_controls,
         csrf_sync=csrf_sync,
+        csrf_manifest=csrf_manifest,
     )
 
 

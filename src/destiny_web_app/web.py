@@ -62,6 +62,7 @@ from destiny_web_app.data_routes import (
     mark_inventory_stale,
     simulate_inventory_failure,
     synchronize_inventory,
+    synchronize_manifest as synchronize_data_manifest,
 )
 from destiny_web_app.database import Database
 from destiny_web_app.inventory import InventoryService
@@ -140,11 +141,6 @@ def create_app(settings: Settings | None = None) -> web.Application:
     bungie = BungieClient(settings)
     app[BUNGIE_CLIENT_KEY] = bungie
     app[TOKEN_REFRESH_LOCKS_KEY] = {}
-    app[INVENTORY_SERVICE_KEY] = InventoryService(
-        database,
-        bungie,
-        stale_seconds=settings.inventory_stale_seconds,
-    )
     manifest_service = ManifestService(
         database,
         bungie,
@@ -152,6 +148,12 @@ def create_app(settings: Settings | None = None) -> web.Application:
         language=settings.manifest_language,
     )
     app[MANIFEST_SERVICE_KEY] = manifest_service
+    app[INVENTORY_SERVICE_KEY] = InventoryService(
+        database,
+        bungie,
+        manifest_service,
+        stale_seconds=settings.inventory_stale_seconds,
+    )
     app[ARMOR_CLEANER_SERVICE_KEY] = ArmorCleanerService(
         database,
         manifest_service,
@@ -196,6 +198,7 @@ def create_app(settings: Settings | None = None) -> web.Application:
             web.get("/data/status", data_status),
             web.get("/data/status.json", data_status_json),
             web.post("/data/inventory/sync", synchronize_inventory),
+            web.post("/data/manifest/sync", synchronize_data_manifest),
             web.post("/data/inventory/mark-stale", mark_inventory_stale),
             web.post(
                 "/data/inventory/simulate-failure",
